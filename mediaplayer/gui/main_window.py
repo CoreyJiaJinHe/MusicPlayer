@@ -1,0 +1,584 @@
+from typing import Optional
+
+from PySide6.QtCore import Qt
+from PySide6.QtCore import QUrl
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+from PySide6.QtWidgets import (
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QListWidget,
+    QLineEdit,
+    QLabel,
+    QComboBox,
+    QMessageBox,
+    QSplitter,
+    QMenuBar,
+    QDialog,
+    QCheckBox,
+    QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
+    QListWidgetItem,
+    QAbstractItemView,
+    QSlider,
+    QGroupBox,
+)
+
+from models import Playlist, MediaFile, OnlineMediaFile, SourceProvider
+from mediaplayer.config.loader import (
+    load_config,
+    get_youtube_api_key,
+    save_config,
+    set_youtube_api_key,
+    set_soundcloud_client_id,
+    get_soundcloud_client_id,
+)
+from mediaplayer.playlist.manager import PlaylistManager
+from mediaplayer.player.facade import PlayerFacade
+from mediaplayer.search.local import search_local
+from mediaplayer.search.youtube import search_youtube
+from mediaplayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Media Player")
+
+        self.cfg = load_config()
+        self.pm = PlaylistManager()
+        self.player = PlayerFacade()
+        self._net = QNetworkAccessManager(self)
+
+        # Left: Playlists
+        self.playlists = QListWidget()
+        self.playlists.addItems(self.pm.names)
+        self.playlists.currentTextChanged.connect(self._on_playlist_selected)
+
+        btn_new_pl = QPushButton("New Playlist")
+        btn_del_pl = QPushButton("Delete Playlist")
+        btn_new_pl.clicked.connect(self._create_playlist)
+        btn_del_pl.clicked.connect(self._delete_playlist)
+
+        left_box = QVBoxLayout()
+        left_box.addWidget(QLabel("Playlists"))
+        left_box.addWidget(self.playlists)
+        left_box.addWidget(btn_new_pl)
+        left_box.addWidget(btn_del_pl)
+        left = QWidget()
+        left.setLayout(left_box)
+
+        # Center: Search + Results
+        self.source = QComboBox()
+        self.source.addItems(["Local", "YouTube", "SoundCloud"])
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Search title...")
+        self.results = QListWidget()
+        btn_search = QPushButton("Search")
+        btn_add = QPushButton("Add to Playlist")
+        btn_search.clicked.connect(self._do_search)
+        btn_add.clicked.connect(self._add_selected_to_playlist)
+
+        center_box = QVBoxLayout()
+        row = QHBoxLayout()
+        row.addWidget(self.source)
+        row.addWidget(self.query)
+        row.addWidget(btn_search)
+        center_box.addLayout(row)
+        center_box.addWidget(self.results)
+        center_box.addWidget(btn_add)
+        center = QWidget()
+        center.setLayout(center_box)
+
+        # Right/Bottom: Player controls and view
+        self.now_playing = QLabel("Now Playing: -")
+        self.btn_play = QPushButton("Play Selected")
+        self.btn_pause = QPushButton("Pause")
+        self.btn_stop = QPushButton("Stop")
+        self.btn_prev = QPushButton("Prev")
+        self.btn_next = QPushButton("Next")
+        self.btn_play.clicked.connect(self._play_selected)
+        self.btn_pause.clicked.connect(self.player.pause)
+        self.btn_stop.clicked.connect(self.player.stop)
+        self.btn_prev.clicked.connect(self._play_prev)
+        self.btn_next.clicked.connect(self._play_next)
+
+        controls = QHBoxLayout()
+        controls.addWidget(self.btn_play)
+        controls.addWidget(self.btn_pause)
+        controls.addWidget(self.btn_stop)
+        controls.addWidget(self.btn_prev)
+        controls.addWidget(self.btn_next)
+        # Volume
+        controls.addWidget(QLabel("Vol"))
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setValue(80)
+        self.vol.valueChanged.connect(self._on_volume_change)
+        controls.addWidget(self.vol)
+
+        right_box = QVBoxLayout()
+        right_box.addWidget(self.now_playing)
+
+        # Online Player area (always visible placeholder)
+        self.web_group = QGroupBox("Online Player")
+        self.web_group_layout = QVBoxLayout(self.web_group)
+        self.web_placeholder = QLabel("Online player will appear here when available")
+        self.web_placeholder.setStyleSheet("color:#aaa; padding:8px;")
+        self.web_group_layout.addWidget(self.web_placeholder)
+        self._web_added = False
+        self._right_box = right_box  # store for later
+
+        # Try to initialize and attach web widget if available (non-fatal if it fails)
+        try:
+            self._attach_web_if_needed(self.web_group)
+        except Exception:
+            # Keep placeholder; detailed error will be shown on first playback attempt
+            pass
+
+        right_box.addWidget(self.web_group)
+        right_box.addLayout(controls)
+        # Current playlist items viewer
+        self.playlist_items = QListWidget()
+        self.playlist_items.setSelectionMode(QListWidget.SingleSelection)
+        self.playlist_items.setDragDropMode(QAbstractItemView.InternalMove)
+        self.playlist_items.itemDoubleClicked.connect(lambda _: self._play_from_playlist(self.playlist_items.currentRow()))
+        right_box.addWidget(QLabel("Playlist Items"))
+        right_box.addWidget(self.playlist_items)
+        # Playlist item actions
+        btn_remove = QPushButton("Remove Selected")
+        btn_save_order = QPushButton("Save Order")
+        btn_remove.clicked.connect(self._remove_selected_from_playlist)
+        btn_save_order.clicked.connect(self._save_playlist_order)
+        actions_row = QHBoxLayout()
+        actions_row.addWidget(btn_remove)
+        actions_row.addWidget(btn_save_order)
+        right_box.addLayout(actions_row)
+        right = QWidget()
+        right.setLayout(right_box)
+        self._right_container = right
+
+        # Menu / Settings
+        self._build_menubar()
+
+        # Main splitter
+        splitter = QSplitter()
+        splitter.addWidget(left)
+        splitter.addWidget(center)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(2, 2)
+
+        root = QVBoxLayout()
+        root.addWidget(splitter)
+        container = QWidget()
+        container.setLayout(root)
+        self.setCentralWidget(container)
+
+        # Playback queue state
+        self._queue_items = []  # type: ignore[var-annotated]
+        self._queue_index = -1
+        self.player.on_end(self._auto_advance)
+        self._current_item = None  # type: ignore[var-annotated]
+
+        # Status timer for local playback progress
+        from PySide6.QtCore import QTimer
+        self._status = QLabel("")
+        right_box.addWidget(self._status)
+        self._timer = QTimer(self)
+        self._timer.setInterval(500)
+        self._timer.timeout.connect(self._update_status)
+        self._timer.start()
+
+        # If any playlist exists, select the first to populate items immediately
+        if self.playlists.count() > 0 and self.playlists.currentRow() < 0:
+            self.playlists.setCurrentRow(0)
+
+    # --- UI helpers ---
+    def _build_menubar(self) -> None:
+        menubar = QMenuBar(self)
+        settings_menu = menubar.addMenu("Settings")
+
+        act_music = settings_menu.addAction("Music Folder...")
+        act_music.triggered.connect(self._choose_music_folder)
+
+        act_flags = settings_menu.addAction("WebEngine Flags...")
+        act_flags.triggered.connect(self._open_flags_dialog)
+
+        act_env = settings_menu.addAction("Edit API Keys (.env)...")
+        act_env.triggered.connect(self._open_env_dialog)
+
+        self.setMenuBar(menubar)
+
+    def _open_flags_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("WebEngine Flags")
+        layout = QVBoxLayout(dlg)
+
+        # Determine current flags
+        current = (self.cfg.webengine_flags or "").split()
+        cb_dc = QCheckBox("Disable Direct Composition (--disable-direct-composition)")
+        cb_gpu = QCheckBox("Disable GPU Acceleration (--disable-gpu)")
+        cb_ap = QCheckBox("Allow Autoplay without Gesture (--autoplay-policy=no-user-gesture-required)")
+        cb_dc.setChecked("--disable-direct-composition" in current or not current)
+        cb_gpu.setChecked("--disable-gpu" in current)
+
+        layout.addWidget(cb_dc)
+        layout.addWidget(cb_gpu)
+        layout.addWidget(cb_ap)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def on_save() -> None:
+            flags = []
+            if cb_dc.isChecked():
+                flags.append("--disable-direct-composition")
+            if cb_gpu.isChecked():
+                flags.append("--disable-gpu")
+            if cb_ap.isChecked():
+                flags.append("--autoplay-policy=no-user-gesture-required")
+            self.cfg.webengine_flags = " ".join(flags) if flags else None
+            from mediaplayer.config.loader import save_config
+
+            save_config(self.cfg)
+            QMessageBox.information(
+                self,
+                "Saved",
+                "Flags saved. Please restart the application for changes to take effect.",
+            )
+            dlg.accept()
+
+        buttons.accepted.connect(on_save)
+        buttons.rejected.connect(dlg.reject)
+
+        dlg.exec()
+
+    def _on_playlist_selected(self, name: str) -> None:
+        p = self.pm.get(name)
+        self.playlist_items.clear()
+        if not p:
+            return
+        for it in p.media_files:
+            itemw = QListWidgetItem(it.title)
+            itemw.setData(Qt.UserRole, self._item_key(it))
+            self.playlist_items.addItem(itemw)
+        # Set queue to this playlist
+        self._queue_items = p.media_files[:]
+        self._queue_index = -1
+
+    def _choose_music_folder(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select Music Folder", self.cfg.music_root or "")
+        if folder:
+            self.cfg.music_root = folder
+            save_config(self.cfg)
+            QMessageBox.information(self, "Saved", f"Music folder set to:\n{folder}")
+
+    def _open_env_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("API Keys (.env)")
+        layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+        inp_yt = QLineEdit(get_youtube_api_key() or "")
+        inp_sc = QLineEdit(get_soundcloud_client_id() or "")
+        form.addRow("YouTube API Key", inp_yt)
+        form.addRow("SoundCloud Client ID", inp_sc)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def on_save() -> None:
+            yt = inp_yt.text().strip() or None
+            sc = inp_sc.text().strip() or None
+            set_youtube_api_key(yt)
+            set_soundcloud_client_id(sc)
+            QMessageBox.information(
+                self,
+                "Saved",
+                ".env updated. Restart the application to load new keys.",
+            )
+            dlg.accept()
+
+        buttons.accepted.connect(on_save)
+        buttons.rejected.connect(dlg.reject)
+
+        dlg.exec()
+
+    def _current_playlist_name(self) -> Optional[str]:
+        item = self.playlists.currentItem()
+        return item.text() if item else None
+
+    def _create_playlist(self) -> None:
+        base = "New Playlist"
+        name = base
+        i = 1
+        while name in self.pm.names:
+            i += 1
+            name = f"{base} {i}"
+        self.pm.create(name)
+        self.playlists.addItem(name)
+        self.playlists.setCurrentRow(self.playlists.count() - 1)
+
+    def _delete_playlist(self) -> None:
+        name = self._current_playlist_name()
+        if not name:
+            return
+        self.pm.delete(name)
+        for i in range(self.playlists.count()):
+            if self.playlists.item(i).text() == name:
+                self.playlists.takeItem(i)
+                break
+
+    def _do_search(self) -> None:
+        source = self.source.currentText()
+        query = self.query.text().strip()
+        self.results.clear()
+        if source == "Local":
+            items = search_local(self.cfg.music_root, query)
+        elif source == "YouTube":
+            api_key = get_youtube_api_key()
+            if not api_key:
+                QMessageBox.information(self, "YouTube API Key", "Create a .env file and set YOUTUBE_API_KEY=... to enable YouTube search.")
+                items = []
+            else:
+                items = search_youtube(api_key, query)
+        else:
+            items = search_soundcloud(query)
+        self._populate_results(items)
+        # stash found items for add/play
+        self._found_items = items  # type: ignore[attr-defined]
+
+    def _add_selected_to_playlist(self) -> None:
+        name = self._current_playlist_name()
+        if not name:
+            QMessageBox.information(self, "Playlist", "Select or create a playlist first.")
+            return
+        row = self.results.currentRow()
+        if row < 0:
+            return
+        item = getattr(self, "_found_items", [])[row]
+        self.pm.add(name, item)
+        # If current playlist matches, update UI immediately
+        cur = self._current_playlist_name()
+        if cur == name:
+            self.playlist_items.addItem(QListWidgetItem(item.title))
+            self._queue_items.append(item)
+        QMessageBox.information(self, "Added", f"Added '{item.title}' to '{name}'.")
+
+    def _play_selected(self) -> None:
+        # Prefer a selection in search results; fallback to playlist items
+        row = self.results.currentRow()
+        item = None
+        if row >= 0:
+            items = getattr(self, "_found_items", [])
+            if items:
+                item = items[row]
+        else:
+            prow = self.playlist_items.currentRow()
+            if prow >= 0 and 0 <= prow < len(self._queue_items):
+                item = self._queue_items[prow]
+        if not item:
+            return
+        self.now_playing.setText(f"Now Playing: {item.title}")
+        # Ensure web player is available and attached if needed
+        from models import SourceProvider as _SP
+        if getattr(item, "provider", None) in (_SP.youtube, _SP.soundcloud):
+            self._attach_web_if_needed(self.web_group)
+        try:
+            self.player.play(item)
+        except RuntimeError as e:
+            QMessageBox.warning(
+                self,
+                "Web Player Error",
+                f"Online playback failed.\n\nDetails: {e}\n\nIf this mentions Qt WebEngine, install PySide6-Addons and restart.",
+            )
+            return
+        self._current_item = item
+
+    def _play_from_playlist(self, index: int) -> None:
+        if index < 0 or index >= len(self._queue_items):
+            return
+        self._queue_index = index
+        item = self._queue_items[index]
+        self.now_playing.setText(f"Now Playing: {item.title}")
+        # Ensure web player is available and attached if needed
+        from models import SourceProvider as _SP
+        if getattr(item, "provider", None) in (_SP.youtube, _SP.soundcloud):
+            self._attach_web_if_needed(self.web_group)
+        try:
+            self.player.play(item)
+        except RuntimeError as e:
+            QMessageBox.warning(
+                self,
+                "Web Player Error",
+                f"Online playback failed.\n\nDetails: {e}\n\nIf this mentions Qt WebEngine, install PySide6-Addons and restart.",
+            )
+            return
+        self._current_item = item
+
+    def _on_volume_change(self, value: int) -> None:
+        try:
+            self.player.set_volume(int(value))
+        except Exception:
+            pass
+
+    def _populate_results(self, items) -> None:  # noqa: ANN001
+        from PySide6.QtGui import QPixmap
+        import requests as _req
+        self.results.clear()
+        for it in items:
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            # Thumbnail (if any)
+            thumb = QLabel()
+            thumb.setFixedSize(120, 90)
+            if getattr(it, "thumbnail_url", None):
+                self._load_thumb(it.thumbnail_url, thumb)
+            lay.addWidget(thumb)
+            # Texts
+            box = QVBoxLayout()
+            t = QLabel(it.title)
+            t.setStyleSheet("font-weight:600;color:#ddd")
+            sub = QLabel(getattr(it, "artist", ""))
+            sub.setStyleSheet("color:#aaa")
+            box.addWidget(t)
+            box.addWidget(sub)
+            lay.addLayout(box)
+            item = QListWidgetItem(self.results)
+            item.setSizeHint(w.sizeHint())
+            self.results.addItem(item)
+            self.results.setItemWidget(item, w)
+
+    def _load_thumb(self, url: str, label: QLabel) -> None:
+        try:
+            req = QNetworkRequest(QUrl(url))
+            reply = self._net.get(req)
+
+            def _on_finished() -> None:
+                from PySide6.QtGui import QPixmap
+                try:
+                    data = reply.readAll()
+                    pm = QPixmap()
+                    if pm.loadFromData(bytes(data)):
+                        label.setPixmap(pm.scaled(120, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                except Exception:
+                    pass
+                finally:
+                    reply.deleteLater()
+
+            reply.finished.connect(_on_finished)
+        except Exception:
+            pass
+
+    def _item_key(self, it) -> str:  # noqa: ANN001
+        prov = getattr(it, "provider", None)
+        prov_val = prov.value if hasattr(prov, "value") else str(prov)
+        if prov_val == "local":
+            return f"{prov_val}:{getattr(it, 'file_path', '')}"
+        # online
+        sid = getattr(it, "source_id", None)
+        url = getattr(it, "url", None)
+        return f"{prov_val}:{sid or url or ''}"
+    def _play_next(self) -> None:
+        if not self._queue_items:
+            return
+        nxt = self._queue_index + 1
+        if nxt < len(self._queue_items):
+            self._play_from_playlist(nxt)
+
+    def _play_prev(self) -> None:
+        if not self._queue_items:
+            return
+        prv = self._queue_index - 1
+        if prv >= 0:
+            self._play_from_playlist(prv)
+
+    def _auto_advance(self) -> None:
+        # Called by player facade when a track ends (local or web)
+        self._play_next()
+
+    def _attach_web_if_needed(self, parent_widget: QWidget) -> None:  # noqa: ANN001
+        # Lazily ensure the web player exists and add to the Online Player box
+        try:
+            created = self.player.ensure_web(parent_widget)
+        except RuntimeError as e:
+            # Surface the error in the placeholder for quick visibility
+            if self.web_placeholder is not None:
+                self.web_placeholder.setText(f"Online player unavailable. Details: {e}")
+            raise
+        if created and not self._web_added:
+            w = self.player.web_widget()
+            if w:
+                # Replace placeholder with the actual web view
+                if self.web_placeholder is not None:
+                    self.web_group_layout.removeWidget(self.web_placeholder)
+                    self.web_placeholder.setParent(None)
+                    self.web_placeholder = None  # type: ignore[assignment]
+                self.web_group_layout.addWidget(w)
+                self._web_added = True
+
+    def _remove_selected_from_playlist(self) -> None:
+        name = self._current_playlist_name()
+        if not name:
+            return
+        row = self.playlist_items.currentRow()
+        if row < 0:
+            return
+        self.pm.remove(name, row)
+        self.playlist_items.takeItem(row)
+        if 0 <= row < len(self._queue_items):
+            del self._queue_items[row]
+            if self._queue_index >= len(self._queue_items):
+                self._queue_index = len(self._queue_items) - 1
+
+    def _save_playlist_order(self) -> None:
+        name = self._current_playlist_name()
+        if not name:
+            return
+        # Read order from list widget and rebuild items accordingly
+        keys = [self.playlist_items.item(i).data(Qt.UserRole) for i in range(self.playlist_items.count())]
+        # Stable match by key order against current queue
+        keymap = {self._item_key(it): it for it in self._queue_items}
+        new_items = [keymap[k] for k in keys if k in keymap]
+        # Persist by replacing the playlist contents
+        try:
+            from mediaplayer.playlist.manager import PlaylistManager
+            # Using existing manager to persist
+            p = self.pm.get(name)
+            if p:
+                p.media_files = new_items
+                self.pm._persist()  # type: ignore[attr-defined]
+                self._queue_items = new_items
+                QMessageBox.information(self, "Saved", "Playlist order saved.")
+        except Exception:
+            QMessageBox.warning(self, "Error", "Failed to save order.")
+
+    def _update_status(self) -> None:
+        # Only reliable for local playback via VLC
+        if not self._current_item:
+            self._status.setText("")
+            return
+        if getattr(self._current_item, "provider", None) != SourceProvider.local:
+            self._status.setText("")
+            return
+        # Query VLC for time
+        try:
+            current_ms = self.player.local.get_time_ms()
+            length_ms = self.player.local.get_length_ms()
+            def fmt(ms: int) -> str:
+                s = max(0, ms // 1000)
+                m, s = divmod(s, 60)
+                h, m = divmod(m, 60)
+                return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+            if length_ms > 0:
+                self._status.setText(f"{fmt(current_ms)} / {fmt(length_ms)}")
+            else:
+                self._status.setText("")
+        except Exception:
+            self._status.setText("")

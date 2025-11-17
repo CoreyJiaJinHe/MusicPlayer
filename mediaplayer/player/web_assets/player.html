@@ -1,0 +1,88 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Web Player</title>
+  <style>html,body,#root{height:100%;margin:0}#root{display:flex;align-items:center;justify-content:center;background:#111}</style>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script>
+    function parseParams(){
+      const p = new URLSearchParams(location.search);
+      return { type: p.get('type'), id: p.get('id'), url: p.get('url') };
+    }
+    let bridge = null;
+    try {
+      if (window.qt && window.qt.webChannelTransport && window.QWebChannel) {
+        new QWebChannel(qt.webChannelTransport, function(channel){ bridge = channel.objects.bridge; });
+      }
+    } catch (e) {
+      // WebChannel not available; continue without it
+      console.warn('Qt WebChannel unavailable:', e);
+    }
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const { type, id, url } = parseParams();
+    let ytPlayer = null; let scWidget = null;
+    if (type === 'youtube' && id) {
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.body.appendChild(tag);
+      window.onYouTubeIframeAPIReady = function(){
+        ytPlayer = new YT.Player('root', {
+          videoId: id,
+          playerVars: { autoplay: 1, playsinline: 1 },
+          events: {
+            'onReady': function(e){
+              try {
+                e.target.unMute();
+                e.target.setVolume(80);
+                e.target.playVideo();
+              } catch (err) {
+                console.warn('YT onReady handling failed', err);
+              }
+            },
+            'onStateChange': function(e){
+              if (e.data === YT.PlayerState.ENDED && bridge && bridge.onEnded) bridge.onEnded();
+            }
+          }
+        });
+      }
+    } else if (type === 'soundcloud' && url) {
+      const iframe = document.createElement('iframe');
+      iframe.allow = 'autoplay';
+      iframe.style.width = '100%';
+      iframe.style.height = '166px';
+      iframe.frameBorder = 'no';
+      iframe.scrolling = 'no';
+      iframe.src = 'https://w.soundcloud.com/player/?url=' + encodeURIComponent(url) + '&auto_play=true';
+      document.getElementById('root').appendChild(iframe);
+      const tag = document.createElement('script');
+      tag.src = 'https://w.soundcloud.com/player/api.js';
+      tag.onload = function(){
+        scWidget = SC.Widget(iframe);
+        scWidget.bind(SC.Widget.Events.FINISH, function(){ if (bridge && bridge.onEnded) bridge.onEnded(); });
+        try { scWidget.setVolume(80); } catch (err) { console.warn('SC setVolume failed', err); }
+        try { scWidget.play(); } catch (err) { console.warn('SC play failed', err); }
+      }
+      document.body.appendChild(tag);
+    } else {
+      const el = document.createElement('div');
+      el.style.color = '#ddd';
+      el.textContent = 'Invalid parameters';
+      document.getElementById('root').appendChild(el);
+    }
+    // Volume API for host
+    window.setVolume = function(pct){
+      try{
+        pct = Math.max(0, Math.min(100, parseInt(pct||0)));
+        if (ytPlayer && ytPlayer.setVolume) ytPlayer.setVolume(pct);
+        if (scWidget && scWidget.setVolume) scWidget.setVolume(pct);
+      }catch(e){}
+    }
+  </script>
+</body>
+</html>
