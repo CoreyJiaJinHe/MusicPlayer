@@ -83,6 +83,22 @@
         if (scWidget && scWidget.setVolume) scWidget.setVolume(pct);
       }catch(e){}
     }
+    // Pause/Stop API for host
+    window.pausePlayback = function(){
+      try{
+        if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo();
+        if (scWidget && scWidget.pause) scWidget.pause();
+      }catch(e){}
+    }
+    window.stopPlayback = function(){
+      try{
+        if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();
+        if (scWidget) {
+          if (scWidget.pause) scWidget.pause();
+          if (scWidget.seekTo) scWidget.seekTo(0);
+        }
+      }catch(e){}
+    }
   </script>
 </body>
 </html>

@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, Optional
 
 from models import MediaFile, OnlineMediaFile, SourceProvider
@@ -59,6 +60,7 @@ class PlayerFacade:
                 raise RuntimeError("Web player not available for online items")
             if item.provider == SourceProvider.youtube and item.source_id:
                 self.web.load_youtube(item.source_id)
+                logging.warning("Loading YouTube video ID: %s", item.source_id)
             elif item.provider == SourceProvider.soundcloud and item.url:
                 self.web.load_soundcloud(item.url)
             else:
@@ -69,9 +71,19 @@ class PlayerFacade:
 
     def pause(self) -> None:
         self.local.pause()
+        if self.web:
+            try:
+                self.web.pause()
+            except Exception:
+                pass
 
     def stop(self) -> None:
         self.local.stop()
+        if self.web:
+            try:
+                self.web.stop()
+            except Exception:
+                pass
 
     def set_volume(self, volume: int) -> None:
         self.local.set_volume(volume)

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QSlider,
     QGroupBox,
+    QSizePolicy,
 )
 
 from models import Playlist, MediaFile, OnlineMediaFile, SourceProvider
@@ -65,9 +66,26 @@ class MainWindow(QMainWindow):
 
         left_box = QVBoxLayout()
         left_box.addWidget(QLabel("Playlists"))
+        # Slimmer playlists column
+        self.playlists.setMaximumWidth(180)
         left_box.addWidget(self.playlists)
         left_box.addWidget(btn_new_pl)
         left_box.addWidget(btn_del_pl)
+        # Move playlist items and actions under playlists
+        self.playlist_items = QListWidget()
+        self.playlist_items.setSelectionMode(QListWidget.SingleSelection)
+        self.playlist_items.setDragDropMode(QAbstractItemView.InternalMove)
+        self.playlist_items.itemDoubleClicked.connect(lambda _: self._play_from_playlist(self.playlist_items.currentRow()))
+        left_box.addWidget(QLabel("Playlist Items"))
+        left_box.addWidget(self.playlist_items)
+        actions_row = QHBoxLayout()
+        btn_remove = QPushButton("Remove Selected")
+        btn_save_order = QPushButton("Save Order")
+        btn_remove.clicked.connect(self._remove_selected_from_playlist)
+        btn_save_order.clicked.connect(self._save_playlist_order)
+        actions_row.addWidget(btn_remove)
+        actions_row.addWidget(btn_save_order)
+        left_box.addLayout(actions_row)
         left = QWidget()
         left.setLayout(left_box)
 
@@ -77,6 +95,8 @@ class MainWindow(QMainWindow):
         self.query = QLineEdit()
         self.query.setPlaceholderText("Search title...")
         self.results = QListWidget()
+        # Higher contrast on white background
+        self.results.setStyleSheet("QListWidget { background: #fff; color: #222; selection-background-color: #e0e7ff; selection-color: #222; border: 1px solid #ccc; }")
         btn_search = QPushButton("Search")
         btn_add = QPushButton("Add to Playlist")
         btn_search.clicked.connect(self._do_search)
@@ -121,13 +141,17 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.vol)
 
         right_box = QVBoxLayout()
+        right_box.setAlignment(Qt.AlignTop)
         right_box.addWidget(self.now_playing)
 
         # Online Player area (always visible placeholder)
         self.web_group = QGroupBox("Online Player")
+        self.web_group.setMinimumHeight(300)
         self.web_group_layout = QVBoxLayout(self.web_group)
+        self.web_group_layout.setContentsMargins(0, 0, 0, 0)
+        self.web_group_layout.setAlignment(Qt.AlignCenter)
         self.web_placeholder = QLabel("Online player will appear here when available")
-        self.web_placeholder.setStyleSheet("color:#aaa; padding:8px;")
+        self.web_placeholder.setStyleSheet("color:#aaa; padding:8px; text-align:center;")
         self.web_group_layout.addWidget(self.web_placeholder)
         self._web_added = False
         self._right_box = right_box  # store for later
@@ -141,22 +165,7 @@ class MainWindow(QMainWindow):
 
         right_box.addWidget(self.web_group)
         right_box.addLayout(controls)
-        # Current playlist items viewer
-        self.playlist_items = QListWidget()
-        self.playlist_items.setSelectionMode(QListWidget.SingleSelection)
-        self.playlist_items.setDragDropMode(QAbstractItemView.InternalMove)
-        self.playlist_items.itemDoubleClicked.connect(lambda _: self._play_from_playlist(self.playlist_items.currentRow()))
-        right_box.addWidget(QLabel("Playlist Items"))
-        right_box.addWidget(self.playlist_items)
-        # Playlist item actions
-        btn_remove = QPushButton("Remove Selected")
-        btn_save_order = QPushButton("Save Order")
-        btn_remove.clicked.connect(self._remove_selected_from_playlist)
-        btn_save_order.clicked.connect(self._save_playlist_order)
-        actions_row = QHBoxLayout()
-        actions_row.addWidget(btn_remove)
-        actions_row.addWidget(btn_save_order)
-        right_box.addLayout(actions_row)
+        # Playlist items and actions moved to left column
         right = QWidget()
         right.setLayout(right_box)
         self._right_container = right
@@ -166,11 +175,11 @@ class MainWindow(QMainWindow):
 
         # Main splitter
         splitter = QSplitter()
-        splitter.addWidget(left)
-        splitter.addWidget(center)
+        splitter.addWidget(center)  # Center column now first
+        splitter.addWidget(left)    # Left column now second
         splitter.addWidget(right)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 2)
 
         root = QVBoxLayout()
@@ -444,9 +453,9 @@ class MainWindow(QMainWindow):
             # Texts
             box = QVBoxLayout()
             t = QLabel(it.title)
-            t.setStyleSheet("font-weight:600;color:#ddd")
+            t.setStyleSheet("font-weight:600;color:#111")
             sub = QLabel(getattr(it, "artist", ""))
-            sub.setStyleSheet("color:#aaa")
+            sub.setStyleSheet("color:#555")
             box.addWidget(t)
             box.addWidget(sub)
             lay.addLayout(box)
@@ -520,7 +529,11 @@ class MainWindow(QMainWindow):
                     self.web_group_layout.removeWidget(self.web_placeholder)
                     self.web_placeholder.setParent(None)
                     self.web_placeholder = None  # type: ignore[assignment]
-                self.web_group_layout.addWidget(w)
+                # Constrain the embedded player width and center it
+                w.setMinimumSize(640, 400)
+                w.setMaximumWidth(640)
+                w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.web_group_layout.addWidget(w, alignment=Qt.AlignCenter)
                 self._web_added = True
 
     def _remove_selected_from_playlist(self) -> None:
