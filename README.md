@@ -1,4 +1,4 @@
-# MediaPlayer (Python)
+# MusicPlayer (Python)
 
 A desktop media player that can search and play local files and stream online tracks (YouTube/SoundCloud) without storing them locally. YouTube/SoundCloud are played via official embedded players; local files via VLC.
 

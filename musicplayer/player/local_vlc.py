@@ -13,7 +13,7 @@ class LocalVLCPlayer:
         self._end_cb: Optional[Callable[[], None]] = None
         if self._player:
             events = self._player.event_manager()
-            events.event_attach(self._event_code("MediaPlayerEndReached"), self._on_end)
+            events.event_attach(self._event_code("MusicPlayerEndReached"), self._on_end)
             # Set reasonable defaults
             try:
                 self._player.audio_set_mute(False)

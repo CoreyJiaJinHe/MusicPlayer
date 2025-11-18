@@ -12,7 +12,7 @@ if load_dotenv:
     load_dotenv()
 
 # Read config to determine WebEngine flags (set before importing Qt)
-from mediaplayer.config.loader import load_config  # noqa: E402
+from MusicPlayer.config.loader import load_config  # noqa: E402
 
 cfg = load_config()
 desired_flags = cfg.webengine_flags
@@ -75,7 +75,7 @@ try:
     _ensure_webengine_runtime_env()
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore import Qt
-    from mediaplayer.gui.main_window import MainWindow
+    from MusicPlayer.gui.main_window import MainWindow
 except Exception as e:
     print("GUI dependencies missing or failed to import:", e)
     print("Install dependencies and run again. See requirements.txt")

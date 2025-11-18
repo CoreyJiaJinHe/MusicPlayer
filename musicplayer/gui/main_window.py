@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from models import Playlist, MediaFile, OnlineMediaFile, SourceProvider
-from mediaplayer.config.loader import (
+from MusicPlayer.config.loader import (
     load_config,
     get_youtube_api_key,
     save_config,
@@ -39,11 +39,11 @@ from mediaplayer.config.loader import (
     set_soundcloud_client_id,
     get_soundcloud_client_id,
 )
-from mediaplayer.playlist.manager import PlaylistManager
-from mediaplayer.player.facade import PlayerFacade
-from mediaplayer.search.local import search_local
-from mediaplayer.search.youtube import search_youtube
-from mediaplayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
+from MusicPlayer.playlist.manager import PlaylistManager
+from MusicPlayer.player.facade import PlayerFacade
+from MusicPlayer.search.local import search_local
+from MusicPlayer.search.youtube import search_youtube, from_url as youtube_from_url
+from MusicPlayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
 
 
 class MainWindow(QMainWindow):
@@ -260,7 +260,7 @@ class MainWindow(QMainWindow):
             if cb_ap.isChecked():
                 flags.append("--autoplay-policy=no-user-gesture-required")
             self.cfg.webengine_flags = " ".join(flags) if flags else None
-            from mediaplayer.config.loader import save_config
+            from MusicPlayer.config.loader import save_config
 
             save_config(self.cfg)
             QMessageBox.information(
@@ -530,7 +530,21 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "YouTube API Key", "Create a .env file and set YOUTUBE_API_KEY=... to enable YouTube search.")
                 items = []
             else:
-                items = search_youtube(api_key, query)
+                # Detect direct URL usage
+                qlow = query.lower()
+                if qlow.startswith("http://") or qlow.startswith("https://"):
+                    if "youtu" in qlow:
+                        direct = youtube_from_url(api_key, query)
+                        if direct:
+                            items = [direct]
+                        else:
+                            QMessageBox.warning(self, "YouTube", "Could not resolve video from URL. Falling back to title search.")
+                            items = search_youtube(api_key, query)
+                    else:
+                        # Not a YouTube URL, fallback to keyword search
+                        items = search_youtube(api_key, query)
+                else:
+                    items = search_youtube(api_key, query)
         else:
             items = search_soundcloud(query)
         self._populate_results(items)
@@ -770,7 +784,7 @@ class MainWindow(QMainWindow):
         new_items = [keymap[k] for k in keys if k in keymap]
         # Persist by replacing the playlist contents
         try:
-            from mediaplayer.playlist.manager import PlaylistManager
+            from MusicPlayer.playlist.manager import PlaylistManager
             # Using existing manager to persist
             p = self.pm.get(name)
             if p:
