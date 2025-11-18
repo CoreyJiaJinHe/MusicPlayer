@@ -77,6 +77,20 @@ class PlayerFacade:
             except Exception:
                 pass
 
+    def resume(self) -> None:
+        # VLC: pause() toggles; resume by toggling if not playing
+        try:
+            # If local is not playing, toggling pause resumes
+            if not self.local.is_playing():
+                self.local.pause()
+        except Exception:
+            pass
+        if self.web:
+            try:
+                self.web.resume()
+            except Exception:
+                pass
+
     def stop(self) -> None:
         self.local.stop()
         if self.web:

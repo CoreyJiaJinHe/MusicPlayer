@@ -197,6 +197,12 @@ class WebEmbedPlayer:
         except Exception:
             pass
 
+    def resume(self) -> None:
+        try:
+            self.view.page().runJavaScript("window.resumePlayback && window.resumePlayback()")
+        except Exception:
+            pass
+
     def stop(self) -> None:
         try:
             self.view.page().runJavaScript("window.stopPlayback && window.stopPlayback()")

@@ -90,6 +90,12 @@
         if (scWidget && scWidget.pause) scWidget.pause();
       }catch(e){}
     }
+    window.resumePlayback = function(){
+      try{
+        if (ytPlayer && ytPlayer.playVideo) ytPlayer.playVideo();
+        if (scWidget && scWidget.play) scWidget.play();
+      }catch(e){}
+    }
     window.stopPlayback = function(){
       try{
         if (ytPlayer && ytPlayer.stopVideo) ytPlayer.stopVideo();

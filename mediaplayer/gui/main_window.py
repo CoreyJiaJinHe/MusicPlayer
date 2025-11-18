@@ -129,8 +129,8 @@ class MainWindow(QMainWindow):
         self.btn_prev = QPushButton("Prev")
         self.btn_next = QPushButton("Next")
         self.btn_play.clicked.connect(self._play_selected)
-        self.btn_pause.clicked.connect(self.player.pause)
-        self.btn_stop.clicked.connect(self.player.stop)
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        self.btn_stop.clicked.connect(self._on_stop_clicked)
         self.btn_prev.clicked.connect(self._play_prev)
         self.btn_next.clicked.connect(self._play_next)
 
@@ -554,6 +554,37 @@ class MainWindow(QMainWindow):
             self._queue_items.append(item)
         QMessageBox.information(self, "Added", f"Added '{item.title}' to '{name}'.")
 
+    def _toggle_pause(self) -> None:
+        # Toggle between pause and resume based on button text
+        try:
+            if self.btn_pause.text().lower().startswith("pause"):
+                self.player.pause()
+                self.btn_pause.setText("Resume")
+                # Mark Now Playing as paused
+                cur = self.now_playing.text()
+                if cur and "[Paused]" not in cur:
+                    self.now_playing.setText(f"{cur} [Paused]")
+            else:
+                # Resume
+                self.player.resume()
+                self.btn_pause.setText("Pause")
+                # Remove paused marker
+                self.now_playing.setText(self.now_playing.text().replace(" [Paused]", ""))
+        except Exception:
+            # Keep UI consistent even if underlying player errors
+            if self.btn_pause.text().lower().startswith("resume"):
+                self.btn_pause.setText("Pause")
+            # Best-effort clean up paused marker
+            self.now_playing.setText(self.now_playing.text().replace(" [Paused]", ""))
+
+    def _on_stop_clicked(self) -> None:
+        try:
+            self.player.stop()
+        finally:
+            # Reset pause button label and remove paused marker from Now Playing
+            self.btn_pause.setText("Pause")
+            self.now_playing.setText(self.now_playing.text().replace(" [Paused]", ""))
+
     def _play_selected(self) -> None:
         # Prefer a selection in search results; fallback to playlist items
         row = self.results.currentRow()
@@ -583,6 +614,8 @@ class MainWindow(QMainWindow):
             )
             return
         self._current_item = item
+        # Reset pause button to Pause state when a new item starts
+        self.btn_pause.setText("Pause")
 
     def _play_from_playlist(self, index: int) -> None:
         if index < 0 or index >= len(self._queue_items):
@@ -604,6 +637,8 @@ class MainWindow(QMainWindow):
             )
             return
         self._current_item = item
+        # Reset pause button to Pause state when a new item starts
+        self.btn_pause.setText("Pause")
 
     def _on_volume_change(self, value: int) -> None:
         try:
