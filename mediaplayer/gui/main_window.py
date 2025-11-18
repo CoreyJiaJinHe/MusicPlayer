@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QSlider,
     QGroupBox,
     QSizePolicy,
+    QInputDialog,
+    QMenu,
 )
 
 from models import Playlist, MediaFile, OnlineMediaFile, SourceProvider
@@ -61,8 +63,10 @@ class MainWindow(QMainWindow):
 
         btn_new_pl = QPushButton("New Playlist")
         btn_del_pl = QPushButton("Delete Playlist")
+        btn_import_pl = QPushButton("Import Playlist")
         btn_new_pl.clicked.connect(self._create_playlist)
         btn_del_pl.clicked.connect(self._delete_playlist)
+        btn_import_pl.clicked.connect(self._import_playlist)
 
         left_box = QVBoxLayout()
         left_box.addWidget(QLabel("Playlists"))
@@ -71,6 +75,7 @@ class MainWindow(QMainWindow):
         left_box.addWidget(self.playlists)
         left_box.addWidget(btn_new_pl)
         left_box.addWidget(btn_del_pl)
+        left_box.addWidget(btn_import_pl)
         # Move playlist items and actions under playlists
         self.playlist_items = QListWidget()
         self.playlist_items.setSelectionMode(QListWidget.SingleSelection)
@@ -86,6 +91,9 @@ class MainWindow(QMainWindow):
         actions_row.addWidget(btn_remove)
         actions_row.addWidget(btn_save_order)
         left_box.addLayout(actions_row)
+        # Context menu for rename on playlists
+        self.playlists.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.playlists.customContextMenuRequested.connect(self._on_playlists_context_menu)
         left = QWidget()
         left.setLayout(left_box)
 
@@ -343,6 +351,172 @@ class MainWindow(QMainWindow):
             if self.playlists.item(i).text() == name:
                 self.playlists.takeItem(i)
                 break
+        # Clear items view if deleted playlist was selected
+        if self._current_playlist_name() != name:
+            self.playlist_items.clear()
+
+    def _on_playlists_context_menu(self, pos) -> None:  # noqa: ANN001
+        item = self.playlists.itemAt(pos)
+        if not item:
+            return
+        menu = QMenu(self.playlists)
+        act_rename = menu.addAction("Rename...")
+        chosen = menu.exec_(self.playlists.mapToGlobal(pos))
+        if chosen == act_rename:
+            old = item.text()
+            new, ok = QInputDialog.getText(self, "Rename Playlist", "New name", QLineEdit.Normal, old)
+            if ok and new.strip() and new.strip() != old:
+                new = new.strip()
+                if new in self.pm.names:
+                    QMessageBox.warning(self, "Exists", f"Playlist '{new}' already exists.")
+                    return
+                try:
+                    self.pm.rename(old, new)
+                except Exception as e:  # pragma: no cover
+                    QMessageBox.warning(self, "Error", f"Rename failed: {e}")
+                    return
+                item.setText(new)
+                # Refresh names list order (simple approach: rebuild list widget)
+                cur = new
+                self.playlists.clear()
+                self.playlists.addItems(self.pm.names)
+                # Set current to renamed
+                for i in range(self.playlists.count()):
+                    if self.playlists.item(i).text() == cur:
+                        self.playlists.setCurrentRow(i)
+                        break
+
+    def _import_playlist(self) -> None:
+        # Dialog to input URL and choose target playlist (or create new)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Playlist")
+        lay = QVBoxLayout(dlg)
+        url_inp = QLineEdit()
+        url_inp.setPlaceholderText("Paste YouTube or SoundCloud playlist URL...")
+        lay.addWidget(QLabel("Playlist URL"))
+        lay.addWidget(url_inp)
+        # Target playlist selection
+        target_box = QComboBox()
+        target_box.addItem("<Create New>")
+        for n in self.pm.names:
+            target_box.addItem(n)
+        lay.addWidget(QLabel("Import Into"))
+        lay.addWidget(target_box)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lay.addWidget(buttons)
+
+        def do_import() -> None:
+            url = url_inp.text().strip()
+            if not url:
+                QMessageBox.information(self, "URL", "Enter a playlist URL.")
+                return
+            try:
+                items, remote_title = self._fetch_playlist_url(url)
+            except RuntimeError as e:
+                QMessageBox.warning(self, "Import Failed", str(e))
+                return
+            if not items:
+                QMessageBox.information(self, "Empty", "No items found in playlist.")
+                return
+            target = target_box.currentText()
+            if target == "<Create New>":
+                # Choose name (default remote title or 'Imported')
+                default_name = remote_title or "Imported Playlist"
+                new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
+                if not ok or not new_name.strip():
+                    return
+                new_name = new_name.strip()
+                if new_name in self.pm.names:
+                    QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
+                    return
+                self.pm.create(new_name)
+                target = new_name
+                self.playlists.addItem(new_name)
+            # Add items
+            for it in items:
+                self.pm.add(target, it)
+            # If target is current playlist, update UI list
+            if self._current_playlist_name() == target:
+                for it in items:
+                    itemw = QListWidgetItem(it.title)
+                    itemw.setData(Qt.UserRole, self._item_key(it))
+                    self.playlist_items.addItem(itemw)
+                self._queue_items.extend(items)
+            QMessageBox.information(self, "Imported", f"Imported {len(items)} items into '{target}'.")
+            dlg.accept()
+
+        buttons.accepted.connect(do_import)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    def _fetch_playlist_url(self, url: str):  # noqa: ANN001
+        from urllib.parse import urlparse, parse_qs
+        import requests
+        api_key = get_youtube_api_key()
+        sc_client_id = get_soundcloud_client_id()
+        u = urlparse(url)
+        host = u.netloc.lower()
+        # Detect YouTube playlist
+        if "youtube" in host or "youtu.be" in host:
+            qs = parse_qs(u.query)
+            playlist_id = qs.get("list", [None])[0]
+            if not playlist_id:
+                raise RuntimeError("Not a YouTube playlist URL (missing list parameter).")
+            if not api_key:
+                raise RuntimeError("YouTube API key not configured.")
+            yt_api = "https://www.googleapis.com/youtube/v3/playlistItems"
+            params = {
+                "part": "snippet",
+                "playlistId": playlist_id,
+                "maxResults": 50,
+                "key": api_key,
+            }
+            items = []
+            remote_title = None
+            while True:
+                r = requests.get(yt_api, params=params, timeout=15)
+                if r.status_code != 200:
+                    raise RuntimeError(f"YouTube API error {r.status_code}: {r.text[:200]}")
+                data = r.json()
+                if remote_title is None:
+                    remote_title = data.get("items", [{}])[0].get("snippet", {}).get("channelTitle") or "YouTube Playlist"
+                for it in data.get("items", []):
+                    snip = it.get("snippet", {})
+                    vid = snip.get("resourceId", {}).get("videoId")
+                    title = snip.get("title") or "(untitled)"
+                    channel = snip.get("videoOwnerChannelTitle") or snip.get("channelTitle") or ""
+                    thumb = snip.get("thumbnails", {}).get("default", {}).get("url")
+                    if vid:
+                        items.append(OnlineMediaFile(title=title, artist=channel, duration=0, file_path="", provider=SourceProvider.youtube, url=f"https://www.youtube.com/watch?v={vid}", source_id=vid, thumbnail_url=thumb))
+                token = data.get("nextPageToken")
+                if not token:
+                    break
+                params["pageToken"] = token
+            return items, remote_title
+        # Detect SoundCloud playlist (sets)
+        if "soundcloud" in host:
+            if not sc_client_id:
+                raise RuntimeError("SoundCloud client id not configured.")
+            resolve = "https://api.soundcloud.com/resolve"
+            rv = requests.get(resolve, params={"url": url, "client_id": sc_client_id}, timeout=15)
+            if rv.status_code != 200:
+                raise RuntimeError(f"SoundCloud resolve error {rv.status_code}: {rv.text[:200]}")
+            meta = rv.json()
+            if meta.get("kind") != "playlist":
+                raise RuntimeError("URL did not resolve to a SoundCloud playlist.")
+            remote_title = meta.get("title") or "SoundCloud Playlist"
+            items = []
+            for track in meta.get("tracks", []):
+                title = track.get("title") or "(untitled)"
+                artist = (track.get("user") or {}).get("username") or ""
+                duration_ms = track.get("duration") or 0
+                duration = int(duration_ms / 1000)
+                tid = track.get("id")
+                permalink = track.get("permalink_url") or ""
+                thumb = (track.get("artwork_url") or "").replace("large", "t500x500") if track.get("artwork_url") else None
+                items.append(OnlineMediaFile(title=title, artist=artist, duration=duration, file_path="", provider=SourceProvider.soundcloud, url=permalink, source_id=str(tid) if tid else None, thumbnail_url=thumb))
+            return items, remote_title
+        raise RuntimeError("Unrecognized or unsupported playlist URL.")
 
     def _do_search(self) -> None:
         source = self.source.currentText()
