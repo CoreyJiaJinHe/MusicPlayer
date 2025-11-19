@@ -1,7 +1,7 @@
 from typing import Optional
 
 from PySide6.QtCore import Qt
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, QTimer, QThread, QObject, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QSizePolicy,
     QInputDialog,
-    QMenu,
+    QMenu
 )
 
 from models import Playlist, MediaFile, OnlineMediaFile, SourceProvider
@@ -44,6 +44,23 @@ from MusicPlayer.player.facade import PlayerFacade
 from MusicPlayer.search.local import search_local
 from MusicPlayer.search.youtube import search_youtube, from_url as youtube_from_url
 from MusicPlayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
+
+
+class ImportWorker(QObject):
+    finished = Signal(list, str, str)  # items, remote_title, error
+
+    def __init__(self, url, fetch_func):
+        super().__init__()
+        self.url = url
+        self.fetch_func = fetch_func
+
+    def run(self):
+        # Only data fetching; no UI operations here
+        try:
+            items, remote_title = self.fetch_func(self.url)
+            self.finished.emit(items, remote_title, "")
+        except Exception as e:
+            self.finished.emit([], "", str(e))
 
 
 class MainWindow(QMainWindow):
@@ -70,17 +87,22 @@ class MainWindow(QMainWindow):
 
         left_box = QVBoxLayout()
         left_box.addWidget(QLabel("Playlists"))
-        # Slimmer playlists column
-        self.playlists.setMaximumWidth(180)
+        # Reduce playlist selection box height and width
+        self.playlists.setMaximumWidth(180) # Reduced width for more space for items
+        self.playlists.setMaximumHeight(120)  # Reduced height for more space for items
         left_box.addWidget(self.playlists)
         left_box.addWidget(btn_new_pl)
         left_box.addWidget(btn_del_pl)
         left_box.addWidget(btn_import_pl)
         # Move playlist items and actions under playlists
         self.playlist_items = QListWidget()
-        self.playlist_items.setSelectionMode(QListWidget.SingleSelection)
+        self.playlist_items.setSelectionMode(QAbstractItemView.ExtendedSelection)  # Enable multi-selection
         self.playlist_items.setDragDropMode(QAbstractItemView.InternalMove)
         self.playlist_items.itemDoubleClicked.connect(lambda _: self._play_from_playlist(self.playlist_items.currentRow()))
+        self.playlist_items.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.playlist_items.customContextMenuRequested.connect(self._on_playlist_items_context_menu)
+    
+        self.advanced_details = False  # Advanced details toggle
         left_box.addWidget(QLabel("Playlist Items"))
         left_box.addWidget(self.playlist_items)
         actions_row = QHBoxLayout()
@@ -229,7 +251,27 @@ class MainWindow(QMainWindow):
         act_env = settings_menu.addAction("Edit API Keys (.env)...")
         act_env.triggered.connect(self._open_env_dialog)
 
+        # Advanced Details setting via dialog
+        act_adv_details = settings_menu.addAction("Advanced Details...")
+        act_adv_details.triggered.connect(self._open_advanced_details_dialog)
+
         self.setMenuBar(menubar)
+    def _open_advanced_details_dialog(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Advanced Details Settings")
+        layout = QVBoxLayout(dlg)
+        cb_adv = QCheckBox("Show Advanced Details for Playlist Items")
+        cb_adv.setChecked(self.advanced_details)
+        layout.addWidget(cb_adv)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+        def on_ok():
+            self.advanced_details = cb_adv.isChecked()
+            self._on_playlist_selected(self._current_playlist_name() or "")
+            dlg.accept()
+        buttons.accepted.connect(on_ok)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
 
     def _open_flags_dialog(self) -> None:
         dlg = QDialog(self)
@@ -280,10 +322,35 @@ class MainWindow(QMainWindow):
         self.playlist_items.clear()
         if not p:
             return
-        for it in p.media_files:
-            itemw = QListWidgetItem(it.title)
-            itemw.setData(Qt.UserRole, self._item_key(it))
-            self.playlist_items.addItem(itemw)
+        if self.advanced_details:
+            # Show as cards with thumbnail, title, uploader
+            from PySide6.QtGui import QPixmap
+            for it in p.media_files:
+                w = QWidget()
+                lay = QHBoxLayout(w)
+                thumb = QLabel()
+                thumb.setFixedSize(80, 60)
+                if getattr(it, "thumbnail_url", None):
+                    self._load_thumb(it.thumbnail_url, thumb)
+                lay.addWidget(thumb)
+                box = QVBoxLayout()
+                t = QLabel(it.title)
+                t.setStyleSheet("font-weight:600;color:#111")
+                sub = QLabel(getattr(it, "artist", getattr(it, "uploader", "")))
+                sub.setStyleSheet("color:#555")
+                box.addWidget(t)
+                box.addWidget(sub)
+                lay.addLayout(box)
+                itemw = QListWidgetItem(self.playlist_items)
+                itemw.setSizeHint(w.sizeHint())
+                itemw.setData(Qt.UserRole, self._item_key(it))
+                self.playlist_items.addItem(itemw)
+                self.playlist_items.setItemWidget(itemw, w)
+        else:
+            for it in p.media_files:
+                itemw = QListWidgetItem(it.title)
+                itemw.setData(Qt.UserRole, self._item_key(it))
+                self.playlist_items.addItem(itemw)
         # Set queue to this playlist
         self._queue_items = p.media_files[:]
         self._queue_index = -1
@@ -387,7 +454,7 @@ class MainWindow(QMainWindow):
                         break
 
     def _import_playlist(self) -> None:
-        # Dialog to input URL and choose target playlist (or create new)
+        # Non-blocking dialog to input URL and choose target playlist
         dlg = QDialog(self)
         dlg.setWindowTitle("Import Playlist")
         lay = QVBoxLayout(dlg)
@@ -395,13 +462,14 @@ class MainWindow(QMainWindow):
         url_inp.setPlaceholderText("Paste YouTube or SoundCloud playlist URL...")
         lay.addWidget(QLabel("Playlist URL"))
         lay.addWidget(url_inp)
-        # Target playlist selection
         target_box = QComboBox()
         target_box.addItem("<Create New>")
         for n in self.pm.names:
             target_box.addItem(n)
         lay.addWidget(QLabel("Import Into"))
         lay.addWidget(target_box)
+        status_lbl = QLabel("")
+        lay.addWidget(status_lbl)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         lay.addWidget(buttons)
 
@@ -410,44 +478,31 @@ class MainWindow(QMainWindow):
             if not url:
                 QMessageBox.information(self, "URL", "Enter a playlist URL.")
                 return
-            try:
-                items, remote_title = self._fetch_playlist_url(url)
-            except RuntimeError as e:
-                QMessageBox.warning(self, "Import Failed", str(e))
-                return
-            if not items:
-                QMessageBox.information(self, "Empty", "No items found in playlist.")
-                return
-            target = target_box.currentText()
-            if target == "<Create New>":
-                # Choose name (default remote title or 'Imported')
-                default_name = remote_title or "Imported Playlist"
-                new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
-                if not ok or not new_name.strip():
-                    return
-                new_name = new_name.strip()
-                if new_name in self.pm.names:
-                    QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
-                    return
-                self.pm.create(new_name)
-                target = new_name
-                self.playlists.addItem(new_name)
-            # Add items
-            for it in items:
-                self.pm.add(target, it)
-            # If target is current playlist, update UI list
-            if self._current_playlist_name() == target:
-                for it in items:
-                    itemw = QListWidgetItem(it.title)
-                    itemw.setData(Qt.UserRole, self._item_key(it))
-                    self.playlist_items.addItem(itemw)
-                self._queue_items.extend(items)
-            QMessageBox.information(self, "Imported", f"Imported {len(items)} items into '{target}'.")
-            dlg.accept()
+            buttons.setEnabled(False)
+            status_lbl.setText("Importing... This may take a moment.")
+
+            # Run fetch in background thread
+            self._import_thread = QThread()
+            self._import_worker = ImportWorker(url, self._fetch_playlist_url)
+            self._import_worker.moveToThread(self._import_thread)
+            self._import_thread.started.connect(self._import_worker.run)
+            # Store dialog widgets for use in UI-thread slot
+            self._import_dlg = dlg
+            self._import_buttons = buttons
+            self._import_status_lbl = status_lbl
+            self._import_target_box = target_box
+            # Cleanup and connect finished signal to a MainWindow method
+            self._import_thread.finished.connect(self._import_thread.deleteLater)
+            self._import_worker.finished.connect(self._import_worker.deleteLater)
+            self._import_worker.finished.connect(self._on_import_finished)
+            self._import_thread.start()
 
         buttons.accepted.connect(do_import)
         buttons.rejected.connect(dlg.reject)
-        dlg.exec()
+        # Non-modal to keep main UI interactive
+        self._import_dlg = dlg
+        dlg.setModal(False)
+        dlg.show()
 
     def _fetch_playlist_url(self, url: str):  # noqa: ANN001
         from urllib.parse import urlparse, parse_qs
@@ -476,6 +531,8 @@ class MainWindow(QMainWindow):
             while True:
                 r = requests.get(yt_api, params=params, timeout=15)
                 if r.status_code != 200:
+                    if r.status_code in (401, 403):
+                        raise RuntimeError("YouTube playlist is private or inaccessible (HTTP 403/401).")
                     raise RuntimeError(f"YouTube API error {r.status_code}: {r.text[:200]}")
                 data = r.json()
                 if remote_title is None:
@@ -500,6 +557,8 @@ class MainWindow(QMainWindow):
             resolve = "https://api.soundcloud.com/resolve"
             rv = requests.get(resolve, params={"url": url, "client_id": sc_client_id}, timeout=15)
             if rv.status_code != 200:
+                if rv.status_code in (401, 403):
+                    raise RuntimeError("SoundCloud playlist is private or inaccessible (HTTP 403/401).")
                 raise RuntimeError(f"SoundCloud resolve error {rv.status_code}: {rv.text[:200]}")
             meta = rv.json()
             if meta.get("kind") != "playlist":
@@ -517,6 +576,68 @@ class MainWindow(QMainWindow):
                 items.append(OnlineMediaFile(title=title, artist=artist, duration=duration, file_path="", provider=SourceProvider.soundcloud, url=permalink, source_id=str(tid) if tid else None, thumbnail_url=thumb))
             return items, remote_title
         raise RuntimeError("Unrecognized or unsupported playlist URL.")
+
+    def _on_import_finished(self, items, remote_title, error) -> None:  # noqa: ANN001
+        # Ensure worker thread is asked to quit; do not wait here
+        thr = getattr(self, "_import_thread", None)
+        if thr is not None and thr.isRunning():
+            try:
+                thr.quit()
+            except Exception:
+                pass
+        dlg = getattr(self, "_import_dlg", None)
+        buttons = getattr(self, "_import_buttons", None)
+        status_lbl = getattr(self, "_import_status_lbl", None)
+        target_box = getattr(self, "_import_target_box", None)
+        if not (dlg and buttons and status_lbl and target_box):
+            return
+        if error:
+            QMessageBox.warning(self, "Import Failed", error)
+            try:
+                buttons.setEnabled(True)
+                status_lbl.setText("")
+            except Exception:
+                pass
+            return
+        if not items:
+            QMessageBox.information(self, "Empty", "No items found in playlist.")
+            try:
+                buttons.setEnabled(True)
+                status_lbl.setText("")
+            except Exception:
+                pass
+            return
+        target = target_box.currentText()
+        if target == "<Create New>":
+            default_name = remote_title or "Imported Playlist"
+            new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
+            if not ok or not new_name.strip():
+                buttons.setEnabled(True)
+                status_lbl.setText("")
+                return
+            new_name = new_name.strip()
+            if new_name in self.pm.names:
+                QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
+                buttons.setEnabled(True)
+                status_lbl.setText("")
+                return
+            self.pm.create(new_name)
+            target = new_name
+            self.playlists.addItem(new_name)
+        for it in items:
+            self.pm.add(target, it)
+        if self._current_playlist_name() == target:
+            for it in items:
+                itemw = QListWidgetItem(it.title)
+                itemw.setData(Qt.UserRole, self._item_key(it))
+                self.playlist_items.addItem(itemw)
+            self._queue_items.extend(items)
+        QMessageBox.information(self, "Imported", f"Imported {len(items)} items into '{target}'.")
+        status_lbl.setText("Import complete.")
+        try:
+            dlg.accept()
+        except Exception:
+            pass
 
     def _do_search(self) -> None:
         source = self.source.currentText()
@@ -763,15 +884,19 @@ class MainWindow(QMainWindow):
         name = self._current_playlist_name()
         if not name:
             return
-        row = self.playlist_items.currentRow()
-        if row < 0:
+        selected_items = self.playlist_items.selectedItems()
+        if not selected_items:
             return
-        self.pm.remove(name, row)
-        self.playlist_items.takeItem(row)
-        if 0 <= row < len(self._queue_items):
-            del self._queue_items[row]
-            if self._queue_index >= len(self._queue_items):
-                self._queue_index = len(self._queue_items) - 1
+        # Get selected rows, sort in reverse so we can safely remove
+        rows = sorted([self.playlist_items.row(item) for item in selected_items], reverse=True)
+        for row in rows:
+            self.playlist_items.takeItem(row)
+            self.pm.remove(name, row)
+            if 0 <= row < len(self._queue_items):
+                del self._queue_items[row]
+        # Adjust queue index if needed
+        if self._queue_index >= len(self._queue_items):
+            self._queue_index = len(self._queue_items) - 1
 
     def _save_playlist_order(self) -> None:
         name = self._current_playlist_name()
@@ -818,3 +943,35 @@ class MainWindow(QMainWindow):
                 self._status.setText("")
         except Exception:
             self._status.setText("")
+
+    
+    def _on_playlist_items_context_menu(self, pos):
+        selected = self.playlist_items.selectedItems()
+        if not selected:
+            return
+        menu = QMenu(self.playlist_items)
+        act_top = menu.addAction("Move to Top")
+        act_bottom = menu.addAction("Move to Bottom")
+        act_remove = menu.addAction("Remove from Playlist")
+        chosen = menu.exec_(self.playlist_items.mapToGlobal(pos))
+        rows = [self.playlist_items.row(item) for item in selected]
+        rows.sort()
+        if chosen == act_top:
+            for i, row in enumerate(rows):
+                item = self.playlist_items.takeItem(row - i)
+                self.playlist_items.insertItem(i, item)
+        elif chosen == act_bottom:
+            count = self.playlist_items.count()
+            for i, row in enumerate(rows[::-1]):
+                item = self.playlist_items.takeItem(row)
+                self.playlist_items.insertItem(count - 1, item)
+        elif chosen == act_remove:
+            for row in reversed(rows):
+                self.playlist_items.takeItem(row)
+            # Also remove from queue and playlist manager
+            name = self._current_playlist_name()
+            if name:
+                for row in reversed(rows):
+                    self.pm.remove(name, row)
+                    if 0 <= row < len(self._queue_items):
+                        del self._queue_items[row]
