@@ -66,7 +66,7 @@ class ImportWorker(QObject):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Media Player")
+        self.setWindowTitle("Music Player")
 
         self.cfg = load_config()
         self.pm = PlaylistManager()

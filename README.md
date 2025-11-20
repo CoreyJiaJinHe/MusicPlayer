@@ -1,6 +1,6 @@
 # MusicPlayer (Python)
 
-A desktop media player that can search and play local files and stream online tracks (YouTube/SoundCloud) without storing them locally. YouTube/SoundCloud are played via official embedded players; local files via VLC.
+A desktop music player that can search and play local files and stream online tracks (YouTube/SoundCloud) without storing them locally. YouTube/SoundCloud are played via official embedded players; local files via VLC.
 
 ## Requirements
 - Python 3.11+ (3.13 supported)
@@ -11,6 +11,36 @@ A desktop media player that can search and play local files and stream online tr
 python -m venv .venv
 .venv\Scripts\pip install -r requirements.txt
 ```
+## 1.0.0 Release Build Instructions (Windows)
+
+1. Create and activate a virtual environment (recommended):
+```
+python -m venv .venv
+call .venv\Scripts\activate
+```
+2. Upgrade pip and install dependencies:
+```
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+3. Build the executable using the spec file:
+```
+build_windows.bat
+```
+4. The resulting executable will be at:
+```
+dist\MusicPlayer\MusicPlayer.exe
+```
+5. Test run:
+```
+dist\MusicPlayer\MusicPlayer.exe
+```
+
+## Distribution
+Distribute the single directory `dist\MusicPlayer` or wrap with an installer.
+
+## Version
+Current version: 1.0.0 (see `musicplayer/version.py`).
 
 Secrets go in `.env` (not in `config.json`):
 ```env
