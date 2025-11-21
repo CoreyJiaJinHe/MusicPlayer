@@ -2,6 +2,8 @@
 
 A desktop music player that can search and play local files and stream online tracks (YouTube/SoundCloud) without storing them locally. YouTube/SoundCloud are played via official embedded players; local files via VLC.
 
+Why? Because I hate it when Youtube erases a piece of music from my playlist and I don't notice it is gone until I have already forgotten the song.
+
 ## Requirements
 - Python 3.11+ (3.13 supported)
 - VLC installed (for local playback, required by `python-vlc`)

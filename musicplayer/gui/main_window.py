@@ -81,9 +81,11 @@ class MainWindow(QMainWindow):
         btn_new_pl = QPushButton("New Playlist")
         btn_del_pl = QPushButton("Delete Playlist")
         btn_import_pl = QPushButton("Import Playlist")
+        btn_edit_pl = QPushButton("Edit Playlist")
         btn_new_pl.clicked.connect(self._create_playlist)
         btn_del_pl.clicked.connect(self._delete_playlist)
         btn_import_pl.clicked.connect(self._import_playlist)
+        btn_edit_pl.clicked.connect(self._open_edit_playlist_window)
 
         left_box = QVBoxLayout()
         left_box.addWidget(QLabel("Playlists"))
@@ -94,6 +96,8 @@ class MainWindow(QMainWindow):
         left_box.addWidget(btn_new_pl)
         left_box.addWidget(btn_del_pl)
         left_box.addWidget(btn_import_pl)
+        left_box.addWidget(btn_edit_pl)
+            
         # Move playlist items and actions under playlists
         self.playlist_items = QListWidget()
         self.playlist_items.setSelectionMode(QAbstractItemView.ExtendedSelection)  # Enable multi-selection
@@ -975,3 +979,8 @@ class MainWindow(QMainWindow):
                     self.pm.remove(name, row)
                     if 0 <= row < len(self._queue_items):
                         del self._queue_items[row]
+                        
+    def _open_edit_playlist_window(self):
+        from MusicPlayer.gui.playlist_edit_window import PlaylistEditWindow
+        dlg = PlaylistEditWindow(self)
+        dlg.exec()
