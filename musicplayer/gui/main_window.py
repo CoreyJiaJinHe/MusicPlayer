@@ -72,6 +72,11 @@ class MainWindow(QMainWindow):
         self.pm = PlaylistManager()
         self.player = PlayerFacade()
         self._net = QNetworkAccessManager(self)
+        # Shuffle and loop state
+        self.shuffle_enabled = False
+        self.loop_enabled = True  # Loop is active by default
+        self._shuffled_indices = []
+        self._played_indices = set()
 
         # Left: Playlists
         self.playlists = QListWidget()
@@ -154,6 +159,12 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("Stop")
         self.btn_prev = QPushButton("Prev")
         self.btn_next = QPushButton("Next")
+        self.btn_shuffle = QCheckBox("Shuffle")
+        self.btn_loop = QCheckBox("Loop")
+        self.btn_shuffle.setChecked(False)
+        self.btn_loop.setChecked(True)
+        self.btn_shuffle.stateChanged.connect(self._toggle_shuffle)
+        self.btn_loop.stateChanged.connect(self._toggle_loop)
         self.btn_play.clicked.connect(self._play_selected)
         self.btn_pause.clicked.connect(self._toggle_pause)
         self.btn_stop.clicked.connect(self._on_stop_clicked)
@@ -166,6 +177,8 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.btn_stop)
         controls.addWidget(self.btn_prev)
         controls.addWidget(self.btn_next)
+        controls.addWidget(self.btn_shuffle)
+        controls.addWidget(self.btn_loop)
         # Volume
         controls.addWidget(QLabel("Vol"))
         self.vol = QSlider(Qt.Horizontal)
@@ -356,8 +369,25 @@ class MainWindow(QMainWindow):
                 itemw.setData(Qt.UserRole, self._item_key(it))
                 self.playlist_items.addItem(itemw)
         # Set queue to this playlist
-        self._queue_items = p.media_files[:]
-        self._queue_index = -1
+            self._queue_items = p.media_files[:]
+            self._queue_index = -1
+            self._reset_shuffle()
+    def _toggle_shuffle(self, state):
+        self.shuffle_enabled = bool(state)
+        self._reset_shuffle()
+
+    def _toggle_loop(self, state):
+        self.loop_enabled = bool(state)
+
+    def _reset_shuffle(self):
+        # Reset shuffle state when playlist changes or shuffle toggled
+        self._played_indices = set()
+        if self.shuffle_enabled and self._queue_items:
+            import random
+            self._shuffled_indices = list(range(len(self._queue_items)))
+            random.shuffle(self._shuffled_indices)
+        else:
+            self._shuffled_indices = []
 
     def _choose_music_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Music Folder", self.cfg.music_root or "")
@@ -845,20 +875,58 @@ class MainWindow(QMainWindow):
     def _play_next(self) -> None:
         if not self._queue_items:
             return
-        nxt = self._queue_index + 1
-        if nxt < len(self._queue_items):
-            self._play_from_playlist(nxt)
+        if self.shuffle_enabled:
+            # Play next unplayed shuffled index
+            if len(self._played_indices) == len(self._queue_items):
+                # All played, reset for next round
+                self._played_indices = set()
+                import random
+                self._shuffled_indices = list(range(len(self._queue_items)))
+                random.shuffle(self._shuffled_indices)
+            for idx in self._shuffled_indices:
+                if idx not in self._played_indices:
+                    self._played_indices.add(idx)
+                    self._queue_index = idx
+                    self._play_from_playlist(idx)
+                    return
+            # If nothing found, do nothing
+        else:
+            nxt = self._queue_index + 1
+            if nxt < len(self._queue_items):
+                self._play_from_playlist(nxt)
+            elif self.loop_enabled and self._queue_items:
+                # Loop to start
+                self._queue_index = 0
+                self._play_from_playlist(0)
 
     def _play_prev(self) -> None:
         if not self._queue_items:
             return
-        prv = self._queue_index - 1
-        if prv >= 0:
-            self._play_from_playlist(prv)
+        if self.shuffle_enabled:
+            # Play previous in shuffled order (if possible)
+            played = [idx for idx in self._shuffled_indices if idx in self._played_indices]
+            if played:
+                cur_idx = played.index(self._queue_index) if self._queue_index in played else -1
+                if cur_idx > 0:
+                    prev_idx = played[cur_idx - 1]
+                    self._queue_index = prev_idx
+                    self._play_from_playlist(prev_idx)
+        else:
+            prv = self._queue_index - 1
+            if prv >= 0:
+                self._play_from_playlist(prv)
 
     def _auto_advance(self) -> None:
         # Called by player facade when a track ends (local or web)
-        self._play_next()
+        if self.shuffle_enabled:
+            self._play_next()
+        else:
+            nxt = self._queue_index + 1
+            if nxt < len(self._queue_items):
+                self._play_from_playlist(nxt)
+            elif self.loop_enabled and self._queue_items:
+                self._queue_index = 0
+                self._play_from_playlist(0)
 
     def _attach_web_if_needed(self, parent_widget: QWidget) -> None:  # noqa: ANN001
         # Lazily ensure the web player exists and add to the Online Player box
