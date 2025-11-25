@@ -30,6 +30,7 @@ def _dict_to_mediafile(d: Dict[str, Any]) -> Union[MediaFile, OnlineMediaFile]:
             file_path=d.get("file_path", ""),
             provider=provider,
             note=d.get("note"),
+            unavailable=bool(d.get("unavailable", False)),
             url=d.get("url", ""),
             source_id=d.get("source_id"),
             streaming_quality=d.get("streaming_quality"),
@@ -42,6 +43,7 @@ def _dict_to_mediafile(d: Dict[str, Any]) -> Union[MediaFile, OnlineMediaFile]:
         file_path=d.get("file_path", ""),
         provider=provider,
         note=d.get("note"),
+        unavailable=bool(d.get("unavailable", False)),
     )
 
 

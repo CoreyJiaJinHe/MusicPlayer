@@ -1,5 +1,5 @@
 from typing import Optional
-
+import logging
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QUrl, QTimer, QThread, QObject, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -502,6 +502,11 @@ class MainWindow(QMainWindow):
             target_box.addItem(n)
         lay.addWidget(QLabel("Import Into"))
         lay.addWidget(target_box)
+        # Append/prepend selector for where to insert imported items
+        append_box = QComboBox()
+        append_box.addItems(["End (Append)", "Front (Prepend)"])
+        lay.addWidget(QLabel("Append To"))
+        lay.addWidget(append_box)
         status_lbl = QLabel("")
         lay.addWidget(status_lbl)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -525,6 +530,8 @@ class MainWindow(QMainWindow):
             self._import_buttons = buttons
             self._import_status_lbl = status_lbl
             self._import_target_box = target_box
+            # store append/prepend choice for the finished handler
+            self._import_append_box = append_box
             # Cleanup and connect finished signal to a MainWindow method
             self._import_thread.finished.connect(self._import_thread.deleteLater)
             self._import_worker.finished.connect(self._import_worker.deleteLater)
@@ -642,6 +649,8 @@ class MainWindow(QMainWindow):
                 pass
             return
         target = target_box.currentText()
+        append_box = getattr(self, "_import_append_box", None)
+        append_choice = append_box.currentText() if append_box is not None else "End (Append)"
         if target == "<Create New>":
             default_name = remote_title or "Imported Playlist"
             new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
@@ -658,14 +667,33 @@ class MainWindow(QMainWindow):
             self.pm.create(new_name)
             target = new_name
             self.playlists.addItem(new_name)
-        for it in items:
-            self.pm.add(target, it)
-        if self._current_playlist_name() == target:
+        # Persist into playlist (prepend or append)
+        if append_choice.startswith("Front"):
+            p = self.pm.get(target)
+            if p:
+                p.media_files = items + p.media_files
+                try:
+                    self.pm._persist()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+        else:
             for it in items:
-                itemw = QListWidgetItem(it.title)
-                itemw.setData(Qt.UserRole, self._item_key(it))
-                self.playlist_items.addItem(itemw)
-            self._queue_items.extend(items)
+                self.pm.add(target, it)
+
+        # Update UI and in-memory queue if current playlist is target
+        if self._current_playlist_name() == target:
+            if append_choice.startswith("Front"):
+                for it in reversed(items):
+                    itemw = QListWidgetItem(it.title)
+                    itemw.setData(Qt.UserRole, self._item_key(it))
+                    self.playlist_items.insertItem(0, itemw)
+                self._queue_items = items + self._queue_items
+            else:
+                for it in items:
+                    itemw = QListWidgetItem(it.title)
+                    itemw.setData(Qt.UserRole, self._item_key(it))
+                    self.playlist_items.addItem(itemw)
+                self._queue_items.extend(items)
         QMessageBox.information(self, "Imported", f"Imported {len(items)} items into '{target}'.")
         status_lbl.setText("Import complete.")
         try:
@@ -768,6 +796,10 @@ class MainWindow(QMainWindow):
                 item = self._queue_items[prow]
         if not item:
             return
+        # Skip if marked as unavailable and show message
+        if getattr(item, "unavailable", False):
+            QMessageBox.information(self, "Unavailable", f"'{item.title}' is marked as unavailable and cannot be played.")
+            return
         self.now_playing.setText(f"Now Playing: {item.title}")
         # Ensure web player is available and attached if needed
         from models import SourceProvider as _SP
@@ -791,24 +823,67 @@ class MainWindow(QMainWindow):
             return
         self._queue_index = index
         item = self._queue_items[index]
-        self.now_playing.setText(f"Now Playing: {item.title}")
-        # Ensure web player is available and attached if needed
-        from models import SourceProvider as _SP
-        if getattr(item, "provider", None) in (_SP.youtube, _SP.soundcloud):
-            self._attach_web_if_needed(self.web_group)
-        try:
-            self.player.play(item)
-        except RuntimeError as e:
-            QMessageBox.warning(
-                self,
-                "Web Player Error",
-                f"Online playback failed.\n\nDetails: {e}\n\nIf this mentions Qt WebEngine, install PySide6-Addons and restart.",
-            )
+        # Skip if marked as unavailable
+        if getattr(item, "unavailable", False):
+            self._play_next()
             return
-        self._current_item = item
-        # Reset pause button to Pause state when a new item starts
-        self.btn_pause.setText("Pause")
+        self.now_playing.setText(f"Now Playing: {item.title}")
+        from models import SourceProvider as _SP
+        if getattr(item, "provider", None) == _SP.youtube:
+            self._attach_web_if_needed(self.web_group)
+            try:
+                self.player.play(item)
+            except RuntimeError as e:
+                QMessageBox.warning(
+                    self,
+                    "Web Player Error",
+                    f"Online playback failed.\n\nDetails: {e}\n\nIf this mentions Qt WebEngine, install PySide6-Addons and restart.",
+                )
+                return
+            self._current_item = item
+            self.btn_pause.setText("Pause")
+            # --- YouTube playback check ---
+            web_widget = self.player.web_widget()
+            if web_widget:
+                def check_youtube_playback():
+                    # getPlayerState: 1=playing, 2=paused, 0=ended, 5=video cued
+                    js = "try { ytPlayer.getPlayerState(); } catch(e) { -1; }"
+                    web_widget.page().runJavaScript(js, lambda state: self._handle_youtube_playback_state(state, index))
+                QTimer.singleShot(8000, check_youtube_playback)
+        else:
+            # SoundCloud or local
+            try:
+                self.player.play(item)
+            except RuntimeError as e:
+                QMessageBox.warning(
+                    self,
+                    "Web Player Error",
+                    f"Online playback failed.\n\nDetails: {e}\n\nIf this mentions Qt WebEngine, install PySide6-Addons and restart.",
+                )
+                return
+            self._current_item = item
+            self.btn_pause.setText("Pause")
 
+    def _handle_youtube_playback_state(self, state, index):
+        # Only skip if still on the same song
+        if index != self._queue_index:
+            return
+        # 1 = playing, 2 = paused, 0 = ended, 5 = video cued, -1 = error
+        if state != 1:
+            item = self._queue_items[index]
+            item.unavailable = True
+            # Persist change to playlist.json
+            name = self._current_playlist_name()
+            if name:
+                p = self.pm.get(name)
+                if p:
+                    # Find and update the matching item in the playlist
+                    for mf in p.media_files:
+                        if getattr(mf, "source_id", None) == getattr(item, "source_id", None):
+                            mf.unavailable = True
+                    self.pm._persist()
+            self._play_next()
+            
     def _on_volume_change(self, value: int) -> None:
         try:
             self.player.set_volume(int(value))
@@ -876,7 +951,7 @@ class MainWindow(QMainWindow):
         if not self._queue_items:
             return
         if self.shuffle_enabled:
-            # Play next unplayed shuffled index
+            # Play next unplayed shuffled index, skipping unavailable items
             if len(self._played_indices) == len(self._queue_items):
                 # All played, reset for next round
                 self._played_indices = set()
@@ -885,6 +960,10 @@ class MainWindow(QMainWindow):
                 random.shuffle(self._shuffled_indices)
             for idx in self._shuffled_indices:
                 if idx not in self._played_indices:
+                    # Skip unavailable tracks
+                    if getattr(self._queue_items[idx], "unavailable", False):
+                        self._played_indices.add(idx)
+                        continue
                     self._played_indices.add(idx)
                     self._queue_index = idx
                     self._play_from_playlist(idx)
@@ -892,12 +971,19 @@ class MainWindow(QMainWindow):
             # If nothing found, do nothing
         else:
             nxt = self._queue_index + 1
+            # Skip unavailable tracks in sequential mode
+            while nxt < len(self._queue_items) and getattr(self._queue_items[nxt], "unavailable", False):
+                nxt += 1
             if nxt < len(self._queue_items):
                 self._play_from_playlist(nxt)
             elif self.loop_enabled and self._queue_items:
-                # Loop to start
-                self._queue_index = 0
-                self._play_from_playlist(0)
+                # Loop to start, but skip unavailable tracks
+                nxt = 0
+                while nxt < len(self._queue_items) and getattr(self._queue_items[nxt], "unavailable", False):
+                    nxt += 1
+                if nxt < len(self._queue_items):
+                    self._queue_index = nxt
+                    self._play_from_playlist(nxt)
 
     def _play_prev(self) -> None:
         if not self._queue_items:

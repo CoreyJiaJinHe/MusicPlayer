@@ -17,7 +17,8 @@ class MediaFile:
     file_path: str  # For local media; may be empty for online items
     provider: SourceProvider = SourceProvider.local
     note: Optional[str] = None
-
+    unavailable: bool = False  # Flag for unplayable tracks (e.g., YouTube restrictions)
+    
 @dataclass
 class Playlist:
     name: str
