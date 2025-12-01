@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QSlider,
     QGroupBox,
+    QScrollArea,
     QSizePolicy,
     QInputDialog,
     QMenu
@@ -102,16 +103,21 @@ class MainWindow(QMainWindow):
         left_box.addWidget(btn_del_pl)
         left_box.addWidget(btn_import_pl)
         left_box.addWidget(btn_edit_pl)
+        # Preference: auto-scroll queue to current track when playback changes
+        self.auto_scroll_queue = True
+        # Hold references to card widgets for scrolling/highlighting
+        self._queue_card_widgets = []
             
-        # Move playlist items and actions under playlists
+        # Playlist items: containerized so it can be shown/hidden via a toggle button
         self.playlist_items = QListWidget()
         self.playlist_items.setSelectionMode(QAbstractItemView.ExtendedSelection)  # Enable multi-selection
         self.playlist_items.setDragDropMode(QAbstractItemView.InternalMove)
         self.playlist_items.itemDoubleClicked.connect(lambda _: self._play_from_playlist(self.playlist_items.currentRow()))
         self.playlist_items.setContextMenuPolicy(Qt.CustomContextMenu)
         self.playlist_items.customContextMenuRequested.connect(self._on_playlist_items_context_menu)
-    
+
         self.advanced_details = False  # Advanced details toggle
+
         left_box.addWidget(QLabel("Playlist Items"))
         left_box.addWidget(self.playlist_items)
         actions_row = QHBoxLayout()
@@ -154,6 +160,9 @@ class MainWindow(QMainWindow):
 
         # Right/Bottom: Player controls and view
         self.now_playing = QLabel("Now Playing: -")
+        # Label to indicate which playlist/queue we're playing from
+        self.play_source_label = QLabel("")
+        self.play_source_label.setStyleSheet("color:#666;font-size:11px;")
         self.btn_play = QPushButton("Play Selected")
         self.btn_pause = QPushButton("Pause")
         self.btn_stop = QPushButton("Stop")
@@ -189,6 +198,7 @@ class MainWindow(QMainWindow):
 
         right_box = QVBoxLayout()
         right_box.setAlignment(Qt.AlignTop)
+        right_box.addWidget(self.play_source_label)
         right_box.addWidget(self.now_playing)
 
         # Online Player area (always visible placeholder)
@@ -212,6 +222,29 @@ class MainWindow(QMainWindow):
 
         right_box.addWidget(self.web_group)
         right_box.addLayout(controls)
+        # Queue toggle and horizontally-scrollable cards (hidden by default)
+        self.btn_toggle_queue = QPushButton("Show Queue")
+        self.btn_toggle_queue.setCheckable(True)
+        self.btn_toggle_queue.clicked.connect(self._toggle_queue_view)
+        # Queue toggle and auto-scroll checkbox
+        qrow = QHBoxLayout()
+        qrow.addWidget(self.btn_toggle_queue)
+        self.chk_auto_scroll = QCheckBox("Auto-scroll")
+        self.chk_auto_scroll.setChecked(self.auto_scroll_queue)
+        # Toggle auto-scroll preference
+        self.chk_auto_scroll.toggled.connect(lambda v: setattr(self, 'auto_scroll_queue', bool(v)))
+        qrow.addWidget(self.chk_auto_scroll)
+        right_box.addLayout(qrow)
+
+        self._queue_scroll = QScrollArea()
+        self._queue_scroll.setWidgetResizable(True)
+        self._queue_container = QWidget()
+        self._queue_layout = QHBoxLayout(self._queue_container)
+        self._queue_layout.setContentsMargins(4, 4, 4, 4)
+        self._queue_layout.setSpacing(8)
+        self._queue_scroll.setWidget(self._queue_container)
+        self._queue_scroll.setVisible(False)
+        right_box.addWidget(self._queue_scroll)
         # Playlist items and actions moved to left column
         right = QWidget()
         right.setLayout(right_box)
@@ -240,9 +273,15 @@ class MainWindow(QMainWindow):
         self._queue_index = -1
         self.player.on_end(self._auto_advance)
         self._current_item = None  # type: ignore[var-annotated]
+        # Track whether Stop has been pressed (prevents monitors from acting)
+        self._stopped = False
+        # Track current play source: None, playlist name, or 'merged'
+        self._current_play_source = None
+        # Preference: deduplicate merged playlists
+        self.dedupe_merged = True
 
         # Status timer for local playback progress
-        from PySide6.QtCore import QTimer
+        # QTimer already imported at module level
         self._status = QLabel("")
         right_box.addWidget(self._status)
         self._timer = QTimer(self)
@@ -272,6 +311,13 @@ class MainWindow(QMainWindow):
         act_adv_details = settings_menu.addAction("Advanced Details...")
         act_adv_details.triggered.connect(self._open_advanced_details_dialog)
 
+        # Advanced menu (exposes Play Combined functionality)
+        adv_menu = menubar.addMenu("Advanced")
+        act_play_combined = adv_menu.addAction("Play Combined...")
+        act_play_combined_shuffle = adv_menu.addAction("Play Combined (Shuffle)")
+        act_play_combined.triggered.connect(lambda: self._open_play_combined_dialog(False))
+        act_play_combined_shuffle.triggered.connect(lambda: self._open_play_combined_dialog(True))
+
         self.setMenuBar(menubar)
     def _open_advanced_details_dialog(self):
         dlg = QDialog(self)
@@ -280,10 +326,14 @@ class MainWindow(QMainWindow):
         cb_adv = QCheckBox("Show Advanced Details for Playlist Items")
         cb_adv.setChecked(self.advanced_details)
         layout.addWidget(cb_adv)
+        cb_dedupe = QCheckBox("Deduplicate merged playlists")
+        cb_dedupe.setChecked(getattr(self, 'dedupe_merged', True))
+        layout.addWidget(cb_dedupe)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         layout.addWidget(buttons)
         def on_ok():
             self.advanced_details = cb_adv.isChecked()
+            self.dedupe_merged = cb_dedupe.isChecked()
             self._on_playlist_selected(self._current_playlist_name() or "")
             dlg.accept()
         buttons.accepted.connect(on_ok)
@@ -341,7 +391,6 @@ class MainWindow(QMainWindow):
             return
         if self.advanced_details:
             # Show as cards with thumbnail, title, uploader
-            from PySide6.QtGui import QPixmap
             for it in p.media_files:
                 w = QWidget()
                 lay = QHBoxLayout(w)
@@ -375,6 +424,67 @@ class MainWindow(QMainWindow):
     def _toggle_shuffle(self, state):
         self.shuffle_enabled = bool(state)
         self._reset_shuffle()
+        # Refresh queue cards and show the queue when shuffle changes
+        try:
+            self._refresh_queue_cards()
+            # auto-show queue when shuffle toggled
+            self._queue_scroll.setVisible(True)
+            self.btn_toggle_queue.setChecked(True)
+            self.btn_toggle_queue.setText("Hide Queue")
+            # Scroll to current track if enabled
+            if self.auto_scroll_queue and self._queue_index >= 0:
+                try:
+                    self._scroll_to_card(self._queue_index)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _play_card(self, index: int) -> None:
+        """Jump to and play the given index from the queue."""
+        try:
+            if index < 0 or index >= len(self._queue_items):
+                return
+            self._queue_index = index
+            self._play_from_playlist(index)
+            # Refresh cards so highlighting updates
+            try:
+                self._refresh_queue_cards()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _scroll_to_card(self, index: int) -> None:
+        """Scroll the queue area to make the given queue index visible.
+
+        The index is a real index into `self._queue_items`. When shuffle is active
+        the displayed order may be based on `_shuffled_indices` so we map accordingly.
+        """
+        try:
+            if not self._queue_card_widgets or index < 0 or index >= len(self._queue_items):
+                return
+            if self.shuffle_enabled and getattr(self, '_shuffled_indices', None):
+                display_indices = list(self._shuffled_indices)
+            else:
+                display_indices = list(range(len(self._queue_items)))
+            if index not in display_indices:
+                return
+            pos = display_indices.index(index)
+            widget = self._queue_card_widgets[pos]
+            try:
+                self._queue_scroll.ensureWidgetVisible(widget)
+            except Exception:
+                # Fallback: adjust scrollbar value to approximate position
+                try:
+                    sb = self._queue_scroll.horizontalScrollBar()
+                    # Compute target as widget x-position
+                    x = widget.x()
+                    sb.setValue(x)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _toggle_loop(self, state):
         self.loop_enabled = bool(state)
@@ -457,9 +567,42 @@ class MainWindow(QMainWindow):
             self.playlist_items.clear()
 
     def _on_playlists_context_menu(self, pos) -> None:  # noqa: ANN001
+        # Allow actions even when right-clicking empty area: Play Combined, Play Combined (Shuffle), Rename
         item = self.playlists.itemAt(pos)
-        if not item:
-            return
+        menu = QMenu(self.playlists)
+        act_play_combined = menu.addAction("Play Combined...")
+        act_play_combined_shuffle = menu.addAction("Play Combined (Shuffle)")
+        act_rename = menu.addAction("Rename...")
+        chosen = menu.exec_(self.playlists.mapToGlobal(pos))
+        if chosen == act_rename:
+            # Rename only when clicking on a specific playlist
+            if not item:
+                return
+            old = item.text()
+            new, ok = QInputDialog.getText(self, "Rename Playlist", "New name", QLineEdit.Normal, old)
+            if ok and new.strip() and new.strip() != old:
+                new = new.strip()
+                if new in self.pm.names:
+                    QMessageBox.warning(self, "Exists", f"Playlist '{new}' already exists.")
+                    return
+                try:
+                    self.pm.rename(old, new)
+                except Exception as e:  # pragma: no cover
+                    QMessageBox.warning(self, "Error", f"Rename failed: {e}")
+                    return
+                item.setText(new)
+                # Refresh names list order (simple approach: rebuild list widget)
+                cur = new
+                self.playlists.clear()
+                self.playlists.addItems(self.pm.names)
+                # Set current to renamed
+                for i in range(self.playlists.count()):
+                    if self.playlists.item(i).text() == cur:
+                        self.playlists.setCurrentRow(i)
+                        break
+        elif chosen == act_play_combined or chosen == act_play_combined_shuffle:
+            shuffle = chosen == act_play_combined_shuffle
+            self._open_play_combined_dialog(shuffle)
         menu = QMenu(self.playlists)
         act_rename = menu.addAction("Rename...")
         chosen = menu.exec_(self.playlists.mapToGlobal(pos))
@@ -701,6 +844,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+            try:
+                # Refresh and auto-show queue for playlist selection
+                self._refresh_queue_cards()
+                self._queue_scroll.setVisible(True)
+                self.btn_toggle_queue.setChecked(True)
+                self.btn_toggle_queue.setText("Hide Queue")
+            except Exception:
+                pass
     def _do_search(self) -> None:
         source = self.source.currentText()
         query = self.query.text().strip()
@@ -765,7 +916,11 @@ class MainWindow(QMainWindow):
                 # Resume
                 self.player.resume()
                 self.btn_pause.setText("Pause")
-                # Remove paused marker
+                # Clear stopped when resuming playback and remove paused marker
+                try:
+                    self._stopped = False
+                except Exception:
+                    pass
                 self.now_playing.setText(self.now_playing.text().replace(" [Paused]", ""))
         except Exception:
             # Keep UI consistent even if underlying player errors
@@ -778,9 +933,19 @@ class MainWindow(QMainWindow):
         try:
             self.player.stop()
         finally:
+            # Mark stopped so monitors don't mistake this for playing
+            try:
+                self._stopped = True
+            except Exception:
+                pass
             # Reset pause button label and remove paused marker from Now Playing
             self.btn_pause.setText("Pause")
             self.now_playing.setText(self.now_playing.text().replace(" [Paused]", ""))
+            # Clear play source label when stopped
+            try:
+                self.play_source_label.setText("")
+            except Exception:
+                pass
 
     def _play_selected(self) -> None:
         # Prefer a selection in search results; fallback to playlist items
@@ -815,8 +980,38 @@ class MainWindow(QMainWindow):
             )
             return
         self._current_item = item
+        # Clear stopped flag when starting playback
+        try:
+            self._stopped = False
+        except Exception:
+            pass
         # Reset pause button to Pause state when a new item starts
         self.btn_pause.setText("Pause")
+        # Update play source label and internal source state
+        try:
+            prow = getattr(self, 'playlist_items').currentRow()
+            if prow >= 0 and prow < len(self._queue_items):
+                src = self._current_playlist_name() or ""
+                self._current_play_source = src or None
+                if src:
+                    self.play_source_label.setText(f"Playing from: {src}")
+                else:
+                    self.play_source_label.setText("")
+            else:
+                # Playing from search result or direct add
+                self._current_play_source = None
+                self.play_source_label.setText("")
+        except Exception:
+            self._current_play_source = None
+            try:
+                self.play_source_label.setText("")
+            except Exception:
+                pass
+        # Refresh queue cards to reflect current queue
+        try:
+            self._refresh_queue_cards()
+        except Exception:
+            pass
 
     def _play_from_playlist(self, index: int) -> None:
         if index < 0 or index >= len(self._queue_items):
@@ -842,6 +1037,27 @@ class MainWindow(QMainWindow):
                 return
             self._current_item = item
             self.btn_pause.setText("Pause")
+            # Clear stopped flag when starting playback
+            try:
+                self._stopped = False
+            except Exception:
+                pass
+            # Refresh queue cards to show updated current/previous coloring
+            try:
+                self._refresh_queue_cards()
+            except Exception:
+                pass
+            # Update play source label to the current playlist name unless we're in merged mode
+            try:
+                if getattr(self, '_current_play_source', None) != 'merged':
+                    src = self._current_playlist_name() or ""
+                    self._current_play_source = src or None
+                    if src:
+                        self.play_source_label.setText(f"Playing from: {src}")
+                    else:
+                        self.play_source_label.setText("")
+            except Exception:
+                pass
             # --- YouTube playback check ---
             web_widget = self.player.web_widget()
             if web_widget:
@@ -863,13 +1079,19 @@ class MainWindow(QMainWindow):
                 return
             self._current_item = item
             self.btn_pause.setText("Pause")
+            # Refresh queue cards to show the queue for this playlist
+            try:
+                self._refresh_queue_cards()
+            except Exception:
+                pass
 
     def _handle_youtube_playback_state(self, state, index):
         # Only skip if still on the same song
         if index != self._queue_index:
             return
         # 1 = playing, 2 = paused, 0 = ended, 5 = video cued, -1 = error
-        if state != 1:
+        logging.warning("YouTube playback state: %s", state)
+        if state != 1 and state != 2 :  # not playing or paused
             item = self._queue_items[index]
             item.unavailable = True
             # Persist change to playlist.json
@@ -891,7 +1113,6 @@ class MainWindow(QMainWindow):
             pass
 
     def _populate_results(self, items) -> None:  # noqa: ANN001
-        from PySide6.QtGui import QPixmap
         import requests as _req
         self.results.clear()
         for it in items:
@@ -899,7 +1120,10 @@ class MainWindow(QMainWindow):
             lay = QHBoxLayout(w)
             # Thumbnail (if any)
             thumb = QLabel()
-            thumb.setFixedSize(120, 90)
+            # Slightly shorter thumbnails in the results to avoid vertical letterboxing
+            thumb.setFixedSize(120, 72)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet("background:transparent;")
             if getattr(it, "thumbnail_url", None):
                 self._load_thumb(it.thumbnail_url, thumb)
             lay.addWidget(thumb)
@@ -928,7 +1152,13 @@ class MainWindow(QMainWindow):
                     data = reply.readAll()
                     pm = QPixmap()
                     if pm.loadFromData(bytes(data)):
-                        label.setPixmap(pm.scaled(120, 90, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+                            # Scale to the target label size to avoid padding/letterbox artifacts
+                            try:
+                                w = label.width() or 120
+                                h = label.height() or 90
+                            except Exception:
+                                w, h = 120, 90
+                            label.setPixmap(pm.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 except Exception:
                     pass
                 finally:
@@ -1102,6 +1332,125 @@ class MainWindow(QMainWindow):
         except Exception:
             self._status.setText("")
 
+    def _toggle_queue_view(self) -> None:
+        try:
+            visible = self.btn_toggle_queue.isChecked()
+            self._queue_scroll.setVisible(visible)
+            self.btn_toggle_queue.setText("Hide Queue" if visible else "Show Queue")
+        except Exception:
+            pass
+
+    def _refresh_queue_cards(self) -> None:
+        """Rebuild the horizontal list of cards showing items in the current queue."""
+        try:
+            # Clear existing cards
+            while self._queue_layout.count():
+                item = self._queue_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.setParent(None)
+
+            # Determine display order: use shuffled indices if shuffle mode is active
+            if self.shuffle_enabled and getattr(self, '_shuffled_indices', None):
+                display_indices = list(self._shuffled_indices)
+            else:
+                display_indices = list(range(len(self._queue_items)))
+
+            # Rebuild list of card widgets in display order
+            self._queue_card_widgets = []
+            for pos, idx in enumerate(display_indices):
+                it = self._queue_items[idx]
+                btn = QPushButton()
+                btn.setCheckable(False)
+                btn.setFlat(False)
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setFixedSize(140, 150)
+                # Build card layout inside the button
+                card_w = QWidget()
+                v = QVBoxLayout(card_w)
+                v.setContentsMargins(4, 4, 4, 4)
+                thumb = QLabel()
+                # Slightly shorter thumbnails in the queue to avoid vertical letterboxing
+                thumb.setFixedSize(120, 72)
+                thumb.setAlignment(Qt.AlignCenter)
+                thumb.setStyleSheet("background:transparent;")
+                title = QLabel(it.title)
+                title.setWordWrap(True)
+                title.setFixedWidth(120)
+                title.setStyleSheet("font-size:11px;")
+                v.addWidget(thumb, alignment=Qt.AlignCenter)
+                v.addWidget(title, alignment=Qt.AlignCenter)
+                btn.setLayout(QVBoxLayout())
+                btn.layout().addWidget(card_w)
+                # Load thumbnail if available
+                try:
+                    if getattr(it, 'thumbnail_url', None):
+                        self._load_thumb(it.thumbnail_url, thumb)
+                except Exception:
+                    pass
+
+                # Color by position relative to current displayed position
+                try:
+                    pos_current = None
+                    if self._queue_index in display_indices:
+                        pos_current = display_indices.index(self._queue_index)
+                    if pos_current is not None:
+                        if pos == pos_current:
+                            color = '#d4ffd9'
+                        elif pos < pos_current:
+                            color = '#ffd6d6'
+                        else:
+                            color = '#d6e7ff'
+                    else:
+                        # Fallback to direct index comparison
+                        if self._queue_index == idx:
+                            color = '#d4ffd9'
+                        elif self._queue_index >= 0 and idx < self._queue_index:
+                            color = '#ffd6d6'
+                        else:
+                            color = '#d6e7ff'
+                    btn.setStyleSheet(f'background-color: {color}; border-radius:6px;')
+                except Exception:
+                    pass
+
+                # Connect click to play this real queue index
+                btn.clicked.connect(lambda _, i=idx: self._play_card(i))
+                self._queue_layout.addWidget(btn)
+                self._queue_card_widgets.append(btn)
+
+            # Auto-scroll to current card if enabled
+            try:
+                if self.auto_scroll_queue and self._queue_index >= 0 and self._queue_card_widgets:
+                    if self._queue_index in display_indices:
+                        pos_current = display_indices.index(self._queue_index)
+                        widget = self._queue_card_widgets[pos_current]
+                        # Schedule scrolling after layout settles so it reliably moves into view
+                        def _do_scroll():
+                            try:
+                                # Prefer centering the widget in the viewport
+                                viewport = self._queue_scroll.viewport()
+                                sb = self._queue_scroll.horizontalScrollBar()
+                                # absolute x position of the widget inside the container
+                                x = widget.x()
+                                w = widget.width()
+                                vp_w = viewport.width()
+                                # target scroll value to center the widget
+                                target = max(0, x - (vp_w - w) // 2)
+                                sb.setValue(target)
+                            except Exception:
+                                try:
+                                    self._queue_scroll.ensureWidgetVisible(widget)
+                                except Exception:
+                                    pass
+
+                        QTimer.singleShot(50, _do_scroll)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # removed local nested _play_card; use the class-level `_play_card` method
+
     
     def _on_playlist_items_context_menu(self, pos):
         selected = self.playlist_items.selectedItems()
@@ -1138,3 +1487,101 @@ class MainWindow(QMainWindow):
         from MusicPlayer.gui.playlist_edit_window import PlaylistEditWindow
         dlg = PlaylistEditWindow(self)
         dlg.exec()
+
+    def _open_play_combined_dialog(self, shuffle: bool = False) -> None:
+        """Open a dialog to let the user pick multiple playlists to play together."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Play Combined Playlists")
+        layout = QVBoxLayout(dlg)
+
+        lbl = QLabel("Select playlists to combine into a single queue:")
+        layout.addWidget(lbl)
+
+        lw = QListWidget()
+        lw.setSelectionMode(QAbstractItemView.MultiSelection)
+        for name in self.pm.names:
+            item = QListWidgetItem(name)
+            lw.addItem(item)
+        layout.addWidget(lw)
+
+        cb_shuffle = QCheckBox("Shuffle combined queue")
+        cb_shuffle.setChecked(shuffle)
+        layout.addWidget(cb_shuffle)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
+
+        def on_ok() -> None:
+            sel = [lw.item(i).text() for i in range(lw.count()) if lw.item(i).isSelected()]
+            dlg.accept()
+            if not sel:
+                return
+            self._play_multiple_playlists(sel, cb_shuffle.isChecked())
+
+        buttons.accepted.connect(on_ok)
+        buttons.rejected.connect(dlg.reject)
+        dlg.exec()
+
+    def _play_multiple_playlists(self, playlist_names, shuffle: bool = False) -> None:
+        """Merge the specified playlists into the current queue and begin playback.
+
+        This replaces the current queue with the concatenation of the named playlists
+        and optionally starts in shuffle mode across the combined queue.
+        """
+        combined = []
+        for name in playlist_names:
+            p = self.pm.get(name)
+            if not p:
+                continue
+            combined.extend(p.media_files)
+
+        # Deduplicate while preserving order (by item key) if preference enabled
+        if getattr(self, 'dedupe_merged', True):
+            seen = set()
+            unique = []
+            for it in combined:
+                key = self._item_key(it)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(it)
+            combined = unique
+
+        if not combined:
+            QMessageBox.information(self, "No Items", "No media files found in the selected playlists.")
+            return
+
+        # Replace the in-memory playback queue (do NOT modify stored playlists or the
+        # left-hand `playlist_items` view). This keeps the original playlists intact.
+        self._queue_items = combined
+        self._queue_index = -1
+
+        # Apply shuffle mode if requested (this affects only playback order)
+        try:
+            self.shuffle_enabled = bool(shuffle)
+            self._reset_shuffle()
+        except Exception:
+            self.shuffle_enabled = False
+            self._reset_shuffle()
+
+        # Indicate merged playlist source
+        try:
+            self._current_play_source = 'merged'
+            # Show which playlists are included as a small hint
+            try:
+                names_str = " + ".join(playlist_names)
+            except Exception:
+                names_str = "Merged Playlist"
+            label = f"Playing combined: {names_str}"
+            if shuffle:
+                label += " (shuffled)"
+            self.play_source_label.setText(label)
+        except Exception:
+            pass
+
+        # Refresh cards and start playback from the combined queue
+        try:
+            self._refresh_queue_cards()
+        except Exception:
+            pass
+        self._play_next()

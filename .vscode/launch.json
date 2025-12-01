@@ -6,6 +6,7 @@
       "name": "Run MusicPlayer",
       "type": "debugpy",
       "request": "launch",
+      "python": "${workspaceFolder}\\.venv\\Scripts\\python.exe",
       "program": "${workspaceFolder}\\main.py",
       "cwd": "${workspaceFolder}",
       "console": "integratedTerminal",
