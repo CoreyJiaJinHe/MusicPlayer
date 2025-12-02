@@ -315,8 +315,10 @@ class MainWindow(QMainWindow):
         adv_menu = menubar.addMenu("Advanced")
         act_play_combined = adv_menu.addAction("Play Combined...")
         act_play_combined_shuffle = adv_menu.addAction("Play Combined (Shuffle)")
+        act_show_unavailable = adv_menu.addAction("Show Unavailable...")
         act_play_combined.triggered.connect(lambda: self._open_play_combined_dialog(False))
         act_play_combined_shuffle.triggered.connect(lambda: self._open_play_combined_dialog(True))
+        act_show_unavailable.triggered.connect(self._open_unavailable_dialog)
 
         self.setMenuBar(menubar)
     def _open_advanced_details_dialog(self):
@@ -338,7 +340,144 @@ class MainWindow(QMainWindow):
             dlg.accept()
         buttons.accepted.connect(on_ok)
         buttons.rejected.connect(dlg.reject)
-        dlg.exec()
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            try:
+                dlg.exec()
+            except Exception:
+                pass
+
+    def _open_unavailable_dialog(self) -> None:
+        """Show a dialog listing all unavailable items across playlists as cards."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Unavailable Items")
+        # Open the dialog at a larger default size
+        try:
+            dlg.resize(500, 500)
+        except Exception:
+            pass
+        lay = QVBoxLayout(dlg)
+        info = QLabel("Items marked as unavailable. Click Close to dismiss.")
+        info.setStyleSheet("color:#666")
+        lay.addWidget(info)
+        lw = QListWidget()
+        lay.addWidget(lw)
+        # Collect unavailable items and which playlists contain them
+        items_map = []  # list of tuples (item, [playlist_names])
+        try:
+            # Build reverse index by item key for each playlist
+            for name in self.pm.names:
+                p = self.pm.get(name)
+                if not p:
+                    continue
+                for it in p.media_files:
+                    if getattr(it, "unavailable", False):
+                        key = self._item_key(it)
+                        # Try to merge duplicates into one entry
+                        found = None
+                        for j, (existing, pls) in enumerate(items_map):
+                            if self._item_key(existing) == key:
+                                found = j
+                                break
+                        if found is None:
+                            items_map.append((it, [name]))
+                        else:
+                            items_map[found][1].append(name)
+        except Exception:
+            pass
+
+        # Build card UI per unavailable item
+        for it, pls in items_map:
+            w = QWidget()
+            hbox = QHBoxLayout(w)
+            thumb = QLabel()
+            thumb.setFixedSize(120, 72)
+            thumb.setAlignment(Qt.AlignCenter)
+            if getattr(it, 'thumbnail_url', None):
+                try:
+                    self._load_thumb(it.thumbnail_url, thumb)
+                except Exception:
+                    pass
+            hbox.addWidget(thumb)
+            vbox = QVBoxLayout()
+            title = QLabel(it.title)
+            title.setStyleSheet("font-weight:600;color:#111")
+            artist = QLabel(getattr(it, 'artist', getattr(it, 'uploader', '')))  # fallback for YouTube uploader
+            artist.setStyleSheet("color:#555")
+            # Duration display (seconds -> mm:ss)
+            dur_val = getattr(it, 'duration', 0) or 0
+            def fmt_dur(sec:int) -> str:
+                m, s = divmod(int(sec), 60)
+                return f"{m}:{s:02d}"
+            duration = QLabel(f"Duration: {fmt_dur(dur_val)}")
+            duration.setStyleSheet("color:#555")
+            playlists_lbl = QLabel(f"Playlists: {', '.join(sorted(set(pls)))}")
+            playlists_lbl.setStyleSheet("color:#333")
+            vbox.addWidget(title)
+            vbox.addWidget(artist)
+            vbox.addWidget(duration)
+            vbox.addWidget(playlists_lbl)
+            hbox.addLayout(vbox)
+            itemw = QListWidgetItem(lw)
+            itemw.setSizeHint(w.sizeHint())
+            lw.addItem(itemw)
+            lw.setItemWidget(itemw, w)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        # Add debug action to mark all unavailable items as available
+        btn_mark_all = buttons.addButton("DEBUG: Mark All Available", QDialogButtonBox.ActionRole)
+        lay.addWidget(buttons)
+
+        def _mark_all_available() -> None:
+            try:
+                # Build a set of keys represented in the dialog
+                keys = set()
+                for it, _pls in items_map:
+                    try:
+                        keys.add(self._item_key(it))
+                    except Exception:
+                        pass
+                # Walk all playlists and clear the unavailable flag for matching items
+                for name in self.pm.names:
+                    p = self.pm.get(name)
+                    if not p:
+                        continue
+                    for mf in getattr(p, 'media_files', []):
+                        try:
+                            if getattr(mf, 'unavailable', False) and self._item_key(mf) in keys:
+                                mf.unavailable = False
+                        except Exception:
+                            pass
+                # Persist once after updates
+                try:
+                    self.pm._persist()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                # Optionally refresh queue cards in case current queue was affected
+                try:
+                    self._refresh_queue_cards()
+                except Exception:
+                    pass
+            finally:
+                dlg.accept()
+
+        btn_mark_all.clicked.connect(_mark_all_available)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        # Show non-modally so the main window remains usable while this dialog is open
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            # Fallback to exec if non-modal show fails for some reason
+            try:
+                dlg.exec()
+            except Exception:
+                pass
 
     def _open_flags_dialog(self) -> None:
         dlg = QDialog(self)
@@ -381,8 +520,16 @@ class MainWindow(QMainWindow):
 
         buttons.accepted.connect(on_save)
         buttons.rejected.connect(dlg.reject)
-
-        dlg.exec()
+        # Show non-modally so the main window remains usable while this dialog is open
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            try:
+                dlg.exec()
+            except Exception:
+                pass
 
     def _on_playlist_selected(self, name: str) -> None:
         p = self.pm.get(name)
@@ -535,8 +682,16 @@ class MainWindow(QMainWindow):
 
         buttons.accepted.connect(on_save)
         buttons.rejected.connect(dlg.reject)
-
-        dlg.exec()
+        # Show non-modally so the main window remains usable while this dialog is open
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            try:
+                dlg.exec()
+            except Exception:
+                pass
 
     def _current_playlist_name(self) -> Optional[str]:
         item = self.playlists.currentItem()
