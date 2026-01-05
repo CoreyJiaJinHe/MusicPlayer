@@ -43,7 +43,14 @@ from MusicPlayer.config.loader import (
 from MusicPlayer.playlist.manager import PlaylistManager
 from MusicPlayer.player.facade import PlayerFacade
 from MusicPlayer.search.local import search_local
-from MusicPlayer.search.youtube import search_youtube, from_url as youtube_from_url
+import logging
+from MusicPlayer.search.youtube import (
+    search_youtube,
+    from_url as youtube_from_url,
+    search_youtube_channels,
+    resolve_channel_id,
+    list_channel_videos,
+)
 from MusicPlayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
 
 
@@ -137,6 +144,10 @@ class MainWindow(QMainWindow):
         # Center: Search + Results
         self.source = QComboBox()
         self.source.addItems(["Local", "YouTube", "SoundCloud"])
+        # YouTube search mode: Videos vs Channels
+        self.youtube_mode = QComboBox()
+        self.youtube_mode.addItems(["Videos", "Channels"])
+        self.youtube_mode.setVisible(False)
         self.query = QLineEdit()
         self.query.setPlaceholderText("Search title...")
         self.results = QListWidget()
@@ -146,17 +157,56 @@ class MainWindow(QMainWindow):
         btn_add = QPushButton("Add to Playlist")
         btn_search.clicked.connect(self._do_search)
         btn_add.clicked.connect(self._add_selected_to_playlist)
+        # Expose add button for enable/disable
+        self.btn_add = btn_add
 
         center_box = QVBoxLayout()
         row = QHBoxLayout()
         row.addWidget(self.source)
+        row.addWidget(self.youtube_mode)
         row.addWidget(self.query)
         row.addWidget(btn_search)
         center_box.addLayout(row)
         center_box.addWidget(self.results)
+        # Channel videos controls: Back / Prev / Next / Save All
+        controls_row = QHBoxLayout()
+        self.btn_back_channels = QPushButton("Back to Channels")
+        self.btn_prev_page = QPushButton("Prev Page")
+        self.btn_next_page = QPushButton("Next Page")
+        self.btn_save_all = QPushButton("Save All to New Playlist")
+        for b in (self.btn_back_channels, self.btn_prev_page, self.btn_next_page, self.btn_save_all):
+            b.setVisible(False)
+        self.btn_back_channels.clicked.connect(self._on_back_to_channels)
+        self.btn_prev_page.clicked.connect(self._on_channel_prev_page)
+        self.btn_next_page.clicked.connect(self._on_channel_next_page)
+        self.btn_save_all.clicked.connect(self._on_save_all_results)
+        controls_row.addWidget(self.btn_back_channels)
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.btn_prev_page)
+        controls_row.addWidget(self.btn_next_page)
+        controls_row.addWidget(self.btn_save_all)
+        center_box.addLayout(controls_row)
         center_box.addWidget(btn_add)
         center = QWidget()
         center.setLayout(center_box)
+        # Toggle YouTube mode visibility based on source selection
+        self.source.currentTextChanged.connect(lambda s: self.youtube_mode.setVisible(s == "YouTube"))
+        # Double-click/activate on results for channel → fetch channel videos
+        self.results.itemDoubleClicked.connect(self._on_results_double_clicked)
+        try:
+            self.results.itemActivated.connect(self._on_results_double_clicked)
+        except Exception:
+            pass
+
+        # Track channel videos paging context
+        self._channel_ctx = {
+            "channel_id": None,
+            "channel_name": None,
+            "prev_tokens": [],  # stack of previous tokens
+            "current_token": None,
+            "next_token": None,
+            "cache": {},  # {page_token or None: (items, next_token)}
+        }
 
         # Right/Bottom: Player controls and view
         self.now_playing = QLabel("Now Playing: -")
@@ -1007,10 +1057,22 @@ class MainWindow(QMainWindow):
                 self.btn_toggle_queue.setText("Hide Queue")
             except Exception:
                 pass
+    
     def _do_search(self) -> None:
         source = self.source.currentText()
         query = self.query.text().strip()
         self.results.clear()
+        # Any new search wipes cached channel video pages until a new channel is entered
+        try:
+            if isinstance(self._channel_ctx, dict):
+                self._channel_ctx["cache"] = {}
+                self._channel_ctx["channel_id"] = None
+                self._channel_ctx["channel_name"] = None
+                self._channel_ctx["prev_tokens"] = []
+                self._channel_ctx["current_token"] = None
+                self._channel_ctx["next_token"] = None
+        except Exception:
+            pass
         if source == "Local":
             items = search_local(self.cfg.music_root, query)
         elif source == "YouTube":
@@ -1019,26 +1081,317 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "YouTube API Key", "Create a .env file and set YOUTUBE_API_KEY=... to enable YouTube search.")
                 items = []
             else:
-                # Detect direct URL usage
+                mode = self.youtube_mode.currentText() if self.youtube_mode.isVisible() else "Videos"
                 qlow = query.lower()
-                if qlow.startswith("http://") or qlow.startswith("https://"):
-                    if "youtu" in qlow:
-                        direct = youtube_from_url(api_key, query)
-                        if direct:
-                            items = [direct]
+                if mode == "Channels":
+                    # If user provided a channel URL or ID/handle, resolve and list videos directly
+                    cid = resolve_channel_id(api_key, query)
+                    if cid:
+                        self._enter_channel_videos(cid, query)
+                        return
+                    # Otherwise, perform a channel search
+                    logging.warning("YouTube channel search query='%s'", query)
+                    channels = search_youtube_channels(api_key, query, max_results=10)
+                    logging.warning("YouTube channel search results=%d", len(channels))
+                    self._found_channels = channels  # type: ignore[attr-defined]
+                    self._populate_channel_results(channels)
+                    return
+                else:
+                    # Videos mode: handle inputs differently for URLs vs text
+                    if qlow.startswith("http://") or qlow.startswith("https://"):
+                        # If a YouTube channel URL is provided, inform user to use Channels mode
+                        if "youtu" in qlow and ("/channel/" in qlow or "/@" in qlow):
+                            QMessageBox.information(
+                                self,
+                                "YouTube",
+                                "Videos mode expects video titles or video URLs.\n"
+                                "To browse a channel URL, switch to 'Channels' mode."
+                            )
+                            return
+                        # Otherwise treat as possible direct video URL
+                        if "youtu" in qlow:
+                            direct = youtube_from_url(api_key, query)
+                            if direct:
+                                items = [direct]
+                            else:
+                                QMessageBox.warning(self, "YouTube", "Could not resolve video from URL. Falling back to title search.")
+                                items = search_youtube(api_key, query)
                         else:
-                            QMessageBox.warning(self, "YouTube", "Could not resolve video from URL. Falling back to title search.")
                             items = search_youtube(api_key, query)
                     else:
-                        # Not a YouTube URL, fallback to keyword search
+                        # If the input points to a channel via handle/ID, fetch channel videos directly
+                        cid_try = resolve_channel_id(api_key, query)
+                        if cid_try:
+                            self._enter_channel_videos(cid_try, query)
+                            return
                         items = search_youtube(api_key, query)
-                else:
-                    items = search_youtube(api_key, query)
         else:
             items = search_soundcloud(query)
         self._populate_results(items)
         # stash found items for add/play
         self._found_items = items  # type: ignore[attr-defined]
+        # For general results (not in channel videos view), hide channel controls
+        try:
+            self.btn_add.setEnabled(True)
+            self.btn_back_channels.setVisible(False)
+            self.btn_prev_page.setVisible(False)
+            self.btn_next_page.setVisible(False)
+            self.btn_save_all.setVisible(False)
+        except Exception:
+            pass
+
+    def _populate_channel_results(self, channels) -> None:  # noqa: ANN001
+        """Render YouTube channel search results with profile picture and title.
+        Each entry is clickable (double-click) to fetch that channel's videos.
+        """
+        try:
+            from models import YoutubeChannel as _YC  # local import for type checking
+        except Exception:
+            _YC = object  # type: ignore
+        self.results.clear()
+        logging.warning("Populate channel results: %d entries", len(channels or []))
+        for ch in channels or []:
+            w = QWidget()
+            lay = QHBoxLayout(w)
+            # Channel profile image (if available)
+            thumb = QLabel()
+            thumb.setFixedSize(60, 60)
+            thumb.setAlignment(Qt.AlignCenter)
+            turl = getattr(ch, 'thumbnail_url', None)
+            if turl:
+                try:
+                    self._load_thumb(turl, thumb)
+                except Exception:
+                    pass
+            lay.addWidget(thumb)
+            box = QVBoxLayout()
+            title = QLabel(getattr(ch, 'channel_name', ''))
+            title.setStyleSheet("font-weight:600;color:#111")
+            url_lbl = QLabel(getattr(ch, 'source_url', ''))
+            url_lbl.setStyleSheet("color:#555")
+            box.addWidget(title)
+            box.addWidget(url_lbl)
+            lay.addLayout(box)
+            itemw = QListWidgetItem(self.results)
+            itemw.setSizeHint(w.sizeHint())
+            # Store an identifier for this being a channel entry
+            itemw.setData(Qt.UserRole, {"type": "channel", "id": getattr(ch, 'channel_id', None)})
+            self.results.addItem(itemw)
+            self.results.setItemWidget(itemw, w)
+        # Disable Add-to-Playlist while showing channels, and hide channel-videos controls
+        try:
+            self.btn_add.setEnabled(False)
+            self.btn_back_channels.setVisible(False)
+            self.btn_prev_page.setVisible(False)
+            self.btn_next_page.setVisible(False)
+            self.btn_save_all.setVisible(False)
+        except Exception:
+            pass
+
+    def _on_results_double_clicked(self, item):  # noqa: ANN001
+        """Handle double-clicks on results list. If in channel mode, fetch videos."""
+        try:
+            if self.source.currentText() != "YouTube":
+                return
+            mode = self.youtube_mode.currentText() if self.youtube_mode.isVisible() else "Videos"
+            if mode != "Channels":
+                return
+            api_key = get_youtube_api_key()
+            if not api_key:
+                return
+            # Determine which channel was clicked
+            row = self.results.row(item)
+            channels = getattr(self, "_found_channels", [])
+            if row < 0 or row >= len(channels):
+                return
+            ch = channels[row]
+            logging.warning("Channel selected row=%d id=%s name=%s", row, getattr(ch, 'channel_id', None), getattr(ch, 'channel_name', None))
+            cid = getattr(ch, 'channel_id', None)
+            if not cid:
+                return
+            # Enter channel videos view with paging
+            self._enter_channel_videos(cid, getattr(ch, 'channel_name', '') or getattr(ch, 'source_url', ''))
+        except Exception:
+            pass
+
+    def _enter_channel_videos(self, channel_id: str, channel_name: str) -> None:
+        """Switch UI into channel videos view, initialize paging and fetch first page."""
+        try:
+            logging.warning("Enter channel videos: id=%s name=%s", channel_id, channel_name)
+            self._channel_ctx["channel_id"] = channel_id
+            self._channel_ctx["channel_name"] = channel_name
+            self._channel_ctx["prev_tokens"] = []
+            self._channel_ctx["current_token"] = None
+            self._channel_ctx["next_token"] = None
+            # New channel selection wipes cached pages to avoid cross-channel reuse
+            try:
+                self._channel_ctx["cache"] = {}
+            except Exception:
+                pass
+            # Show channel controls
+            self.btn_back_channels.setVisible(True)
+            self.btn_prev_page.setVisible(False)
+            self.btn_next_page.setVisible(False)
+            self.btn_save_all.setVisible(True)
+            # In channel videos view, allow adding videos
+            self.btn_add.setEnabled(True)
+            # Load first page
+            self._load_channel_page(None)
+        except Exception:
+            pass
+
+    def _load_channel_page(self, page_token: Optional[str]) -> None:
+        api_key = get_youtube_api_key()
+        cid = self._channel_ctx.get("channel_id")
+        if not api_key or not cid:
+            return
+        cache = self._channel_ctx.get("cache") or {}
+        cache_key = page_token  # None for first page
+        cached = cache.get(cache_key)
+        if cached:
+            items, next_token = cached
+            logging.warning("Load channel page from cache: id=%s token=%s items=%d next=%s", cid, page_token, len(items or []), bool(next_token))
+        else:
+            try:
+                logging.warning("Fetch channel page: id=%s token=%s", cid, page_token)
+                items, next_token = list_channel_videos(api_key, cid, max_results=25, page_token=page_token)
+            except Exception as e:
+                logging.exception("Error fetching channel page: %s", e)
+                items, next_token = [], None
+            # Cache the result (even empty to avoid re-calling on back)
+            try:
+                cache[cache_key] = (items, next_token)
+                self._channel_ctx["cache"] = cache
+            except Exception:
+                pass
+        # Update tokens
+        self._channel_ctx["current_token"] = page_token
+        self._channel_ctx["next_token"] = next_token
+        # Update UI controls state
+        try:
+            has_prev = bool(self._channel_ctx.get("prev_tokens"))
+            self.btn_prev_page.setVisible(True)
+            self.btn_prev_page.setEnabled(has_prev)
+            self.btn_next_page.setVisible(True)
+            self.btn_next_page.setEnabled(bool(next_token))
+        except Exception:
+            pass
+        # Populate videos
+        logging.warning("Channel page loaded: items=%d next_token=%s", len(items), bool(next_token))
+        # TEMP: log ordered titles to verify sort/order issues
+        
+        debug_flag = False
+        if debug_flag:
+            try:
+                titles = [getattr(it, 'title', '') for it in (items or [])]
+                human = " | \n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
+                logging.warning("Channel page titles (%d): %s", len(titles), human)
+            except Exception:
+                pass
+        self._found_items = items  # type: ignore[attr-defined]
+        self._populate_results(items)
+        if not items:
+            try:
+                QMessageBox.information(self, "Channel", "No videos found for this channel or request failed.")
+            except Exception:
+                pass
+
+    def _on_channel_next_page(self) -> None:
+        # Push current token then move to next
+        try:
+            cur = self._channel_ctx.get("current_token")
+            nxt = self._channel_ctx.get("next_token")
+            if not nxt:
+                return
+            self._channel_ctx["prev_tokens"].append(cur)
+            self._load_channel_page(nxt)
+        except Exception:
+            pass
+
+    def _on_channel_prev_page(self) -> None:
+        try:
+            prev_stack = self._channel_ctx.get("prev_tokens") or []
+            if not prev_stack:
+                return
+            prev_token = prev_stack.pop()
+            self._channel_ctx["prev_tokens"] = prev_stack
+            self._load_channel_page(prev_token)
+        except Exception:
+            pass
+
+    def _on_back_to_channels(self) -> None:
+        """Return to prior channel search results."""
+        try:
+            logging.warning("Back to channel search results")
+            channels = getattr(self, "_found_channels", [])
+            self._populate_channel_results(channels)
+        except Exception:
+            pass
+
+    def _on_save_all_results(self) -> None:
+        """Save videos from current channel view: support saving first N pages including current."""
+        try:
+            cid = self._channel_ctx.get("channel_id")
+            if not cid:
+                QMessageBox.information(self, "Save", "Not in a channel videos view.")
+                return
+            api_key = get_youtube_api_key()
+            if not api_key:
+                QMessageBox.information(self, "YouTube API Key", "Configure YOUTUBE_API_KEY in .env.")
+                return
+            # Prompt for playlist name
+            default_name = (self._channel_ctx.get("channel_name") or "Channel Videos").strip() or "Channel Videos"
+            new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
+            if not ok or not new_name.strip():
+                return
+            new_name = new_name.strip()
+            if new_name in self.pm.names:
+                QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
+                return
+            # Prompt for number of pages
+            pages, ok_pages = QInputDialog.getInt(self, "Pages", "Save how many pages?", 1, 1, 50, 1)
+            if not ok_pages:
+                return
+            # Collect items starting from current page
+            all_items = []
+            # Start with items currently shown
+            current_items = getattr(self, "_found_items", [])
+            all_items.extend(current_items)
+            next_token = self._channel_ctx.get("next_token")
+            remaining = max(0, pages - 1)
+            cache = self._channel_ctx.get("cache") or {}
+            while remaining > 0 and next_token:
+                # Try cache first
+                cached = cache.get(next_token)
+                if cached:
+                    page_items, nt = cached
+                else:
+                    try:
+                        page_items, nt = list_channel_videos(api_key, cid, max_results=25, page_token=next_token)
+                    except Exception as e:
+                        logging.exception("Error fetching page while saving: %s", e)
+                        break
+                    # Store fetched page using the token we requested with
+                    try:
+                        cache[next_token] = (page_items, nt)
+                        self._channel_ctx["cache"] = cache
+                    except Exception:
+                        pass
+                all_items.extend(page_items)
+                remaining -= 1
+                next_token = nt
+            # Create playlist and persist
+            self.pm.create(new_name)
+            for it in all_items:
+                self.pm.add(new_name, it)
+            self.playlists.addItem(new_name)
+            QMessageBox.information(self, "Saved", f"Saved {len(all_items)} videos to '{new_name}'.")
+        except Exception as e:
+            logging.exception("Save all results failed: %s", e)
+            try:
+                QMessageBox.warning(self, "Save", "Failed to save videos. See logs for details.")
+            except Exception:
+                pass
 
     def _add_selected_to_playlist(self) -> None:
         name = self._current_playlist_name()
@@ -1268,19 +1621,20 @@ class MainWindow(QMainWindow):
             pass
 
     def _populate_results(self, items) -> None:  # noqa: ANN001
-        import requests as _req
         self.results.clear()
-        for it in items:
+        for it in items or []:
             w = QWidget()
             lay = QHBoxLayout(w)
             # Thumbnail (if any)
             thumb = QLabel()
-            # Slightly shorter thumbnails in the results to avoid vertical letterboxing
             thumb.setFixedSize(120, 72)
             thumb.setAlignment(Qt.AlignCenter)
             thumb.setStyleSheet("background:transparent;")
             if getattr(it, "thumbnail_url", None):
-                self._load_thumb(it.thumbnail_url, thumb)
+                try:
+                    self._load_thumb(it.thumbnail_url, thumb)
+                except Exception:
+                    pass
             lay.addWidget(thumb)
             # Texts
             box = QVBoxLayout()
@@ -1291,10 +1645,10 @@ class MainWindow(QMainWindow):
             box.addWidget(t)
             box.addWidget(sub)
             lay.addLayout(box)
-            item = QListWidgetItem(self.results)
-            item.setSizeHint(w.sizeHint())
-            self.results.addItem(item)
-            self.results.setItemWidget(item, w)
+            itemw = QListWidgetItem(self.results)
+            itemw.setSizeHint(w.sizeHint())
+            self.results.addItem(itemw)
+            self.results.setItemWidget(itemw, w)
 
     def _load_thumb(self, url: str, label: QLabel) -> None:
         try:

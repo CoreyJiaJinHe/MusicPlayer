@@ -1,9 +1,9 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import re
 import urllib.parse
 import requests
 
-from models import OnlineMediaFile, SourceProvider
+from models import OnlineMediaFile, SourceProvider, YoutubeChannel
 
 
 def search_youtube(api_key: str, query: str, max_results: int = 10) -> List[OnlineMediaFile]:
@@ -142,3 +142,167 @@ def from_url(api_key: str, url: str) -> Optional[OnlineMediaFile]:
         source_id=vid,
         thumbnail_url=thumb.get('url')
     )
+
+
+def search_youtube_channels(api_key: str, query: str, max_results: int = 10) -> List[YoutubeChannel]:
+    """Search YouTube for channels by name/keyword.
+
+    Returns a list of YoutubeChannel. Thumbnail URLs (when needed for UI) can be
+    read from the search result's snippet; for now, callers can refetch or we
+    can attach as ad-hoc attribute on the dataclass instance.
+    """
+    if not api_key:
+        return []
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "part": "snippet",
+        "q": query,
+        "type": "channel",
+        "maxResults": max_results,
+        "key": api_key,
+    }
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    results: List[YoutubeChannel] = []
+    for item in data.get("items", []):
+        cid = (item.get("id") or {}).get("channelId")
+        snip = item.get("snippet", {})
+        if not cid:
+            continue
+        channel_url = f"https://www.youtube.com/channel/{cid}"
+        ch = YoutubeChannel(source_url=channel_url, channel_id=cid, channel_name=snip.get("channelTitle", ""))
+        # Attach thumbnail URL as an attribute for UI convenience
+        thumbs = (snip.get("thumbnails") or {})
+        thumb = thumbs.get("medium") or thumbs.get("default") or {}
+        setattr(ch, "thumbnail_url", thumb.get("url"))
+        results.append(ch)
+    return results
+
+
+def _extract_channel_from_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Attempt to extract a channelId or handle from a YouTube channel URL.
+
+    Returns (channel_id, handle). Exactly one will be non-None if detected.
+    Supports:
+    - https://www.youtube.com/channel/UCxxxx
+    - https://www.youtube.com/@handle
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return None, None
+    host = (parsed.netloc or '').lower()
+    if 'youtube.com' not in host:
+        return None, None
+    path = parsed.path or ''
+    # /channel/UC...
+    m = re.match(r"^/channel/([A-Za-z0-9_-]+)", path)
+    if m:
+        return m.group(1), None
+    # /@handle or /@handle/...
+    m2 = re.match(r"^/@([A-Za-z0-9._-]+)", path)
+    if m2:
+        return None, m2.group(1)
+    return None, None
+
+
+def resolve_channel_id(api_key: str, text: str) -> Optional[str]:
+    """Resolve a channel identifier from user input which may be:
+    - a channel ID (starts with 'UC')
+    - a YouTube channel URL (/channel/UC...)
+    - a handle URL (/@handle)
+    - a bare handle starting with '@'
+    """
+    if not text:
+        return None
+    t = text.strip()
+    # direct channel ID
+    if t.startswith('UC') and len(t) >= 10:
+        return t
+    # URL forms
+    if t.lower().startswith('http://') or t.lower().startswith('https://'):
+        cid, handle = _extract_channel_from_url(t)
+        if cid:
+            return cid
+        if handle:
+            # search for channels with the handle as query
+            chans = search_youtube_channels(api_key, handle, max_results=1)
+            return chans[0].channel_id if chans else None
+        return None
+    # bare handle like @reina...
+    if t.startswith('@'):
+        handle = t[1:]
+        chans = search_youtube_channels(api_key, handle, max_results=1)
+        return chans[0].channel_id if chans else None
+    return None
+
+
+def list_channel_videos(api_key: str, channel_id: str, max_results: int = 25, page_token: Optional[str] = None) -> Tuple[List[OnlineMediaFile], Optional[str]]:
+    """List videos using the channel's uploads playlist for canonical ordering.
+
+    This aligns with the browser's Videos tab (date-added order). Supports pagination
+    via nextPageToken. max_results is capped at 50 by the API.
+    """
+    if not api_key or not channel_id:
+        return [], None
+    # First, get the uploads playlist ID for the channel
+    channels_ep = "https://www.googleapis.com/youtube/v3/channels"
+    ch_params = {
+        "part": "contentDetails",
+        "id": channel_id,
+        "key": api_key,
+    }
+    cr = requests.get(channels_ep, params=ch_params, timeout=10)
+    cr.raise_for_status()
+    cdata = cr.json()
+    items_c = cdata.get("items") or []
+    if not items_c:
+        return [], None
+    uploads_pl = (items_c[0].get("contentDetails") or {}).get("relatedPlaylists", {}).get("uploads")
+    if not uploads_pl:
+        return [], None
+    # Then list items from the uploads playlist
+    yt_api = "https://www.googleapis.com/youtube/v3/playlistItems"
+    params = {
+        "part": "snippet,contentDetails",
+        "playlistId": uploads_pl,
+        "maxResults": min(max_results or 25, 50),
+        "key": api_key,
+    }
+    if page_token:
+        params["pageToken"] = page_token
+    r = requests.get(yt_api, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    next_token = data.get("nextPageToken")
+    results: List[OnlineMediaFile] = []
+    for it in data.get("items", []):
+        snip = it.get("snippet", {})
+        vid = (snip.get("resourceId") or {}).get("videoId")
+        if not vid:
+            continue
+        title = snip.get("title") or "(untitled)"
+        channel = snip.get("videoOwnerChannelTitle") or snip.get("channelTitle") or ""
+        thumbs = (snip.get("thumbnails") or {})
+        thumb = thumbs.get("medium") or thumbs.get("default") or {}
+        watch = f"https://www.youtube.com/watch?v={vid}"
+        # Optionally include duration when available (contentDetails may have it)
+        # Not all playlistItems contentDetails have duration; separate call would be needed.
+        mf = OnlineMediaFile(
+            title=title,
+            artist=channel,
+            duration=0,
+            file_path="",
+            provider=SourceProvider.youtube,
+            url=watch,
+            source_id=vid,
+            thumbnail_url=thumb.get("url"),
+        )
+        try:
+            setattr(mf, "published_at", snip.get("publishedAt"))
+        except Exception:
+            pass
+        results.append(mf)
+    return results, next_token
+

@@ -34,6 +34,14 @@ class OnlineMediaFile(MediaFile):
     streaming_quality: Optional[str] = None  # e.g., '1080p', '720p', '480p'
     thumbnail_url: Optional[str] = None
 
+@dataclass
+class YoutubeChannel:
+    # Channel search result descriptor
+    source_url: str
+    channel_id: str
+    channel_name: str
+
+
 __all__ = ["MediaFile", "Playlist", "OnlineMediaFile", "SourceProvider"]
     
     
