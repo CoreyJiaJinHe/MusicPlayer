@@ -1,4 +1,5 @@
 from typing import Optional
+import re
 import logging
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QUrl, QTimer, QThread, QObject, Signal
@@ -52,23 +53,13 @@ from MusicPlayer.search.youtube import (
     list_channel_videos,
 )
 from MusicPlayer.search.soundcloud import search_soundcloud, from_url as sc_from_url
+from MusicPlayer.gui.channel_controller import ChannelVideosController
+from MusicPlayer.gui.playlist_importer import PlaylistImporter
+from MusicPlayer.gui.queue_view import QueueViewController
+from MusicPlayer.gui.menu_controller import MenuController
 
 
-class ImportWorker(QObject):
-    finished = Signal(list, str, str)  # items, remote_title, error
-
-    def __init__(self, url, fetch_func):
-        super().__init__()
-        self.url = url
-        self.fetch_func = fetch_func
-
-    def run(self):
-        # Only data fetching; no UI operations here
-        try:
-            items, remote_title = self.fetch_func(self.url)
-            self.finished.emit(items, remote_title, "")
-        except Exception as e:
-            self.finished.emit([], "", str(e))
+# ImportWorker moved to playlist_importer.py
 
 
 class MainWindow(QMainWindow):
@@ -97,7 +88,9 @@ class MainWindow(QMainWindow):
         btn_edit_pl = QPushButton("Edit Playlist")
         btn_new_pl.clicked.connect(self._create_playlist)
         btn_del_pl.clicked.connect(self._delete_playlist)
-        btn_import_pl.clicked.connect(self._import_playlist)
+        # Use PlaylistImporter controller
+        self.playlist_importer = PlaylistImporter(self)
+        btn_import_pl.clicked.connect(self.playlist_importer.open_dialog)
         btn_edit_pl.clicked.connect(self._open_edit_playlist_window)
 
         left_box = QVBoxLayout()
@@ -176,10 +169,10 @@ class MainWindow(QMainWindow):
         self.btn_save_all = QPushButton("Save All to New Playlist")
         for b in (self.btn_back_channels, self.btn_prev_page, self.btn_next_page, self.btn_save_all):
             b.setVisible(False)
-        self.btn_back_channels.clicked.connect(self._on_back_to_channels)
-        self.btn_prev_page.clicked.connect(self._on_channel_prev_page)
-        self.btn_next_page.clicked.connect(self._on_channel_next_page)
-        self.btn_save_all.clicked.connect(self._on_save_all_results)
+        self.btn_back_channels.clicked.connect(lambda: self.channel_controller.on_back_to_channels())
+        self.btn_prev_page.clicked.connect(lambda: self.channel_controller.on_channel_prev_page())
+        self.btn_next_page.clicked.connect(lambda: self.channel_controller.on_channel_next_page())
+        self.btn_save_all.clicked.connect(lambda: self.channel_controller.on_save_all_results())
         controls_row.addWidget(self.btn_back_channels)
         controls_row.addStretch(1)
         controls_row.addWidget(self.btn_prev_page)
@@ -192,21 +185,14 @@ class MainWindow(QMainWindow):
         # Toggle YouTube mode visibility based on source selection
         self.source.currentTextChanged.connect(lambda s: self.youtube_mode.setVisible(s == "YouTube"))
         # Double-click/activate on results for channel → fetch channel videos
-        self.results.itemDoubleClicked.connect(self._on_results_double_clicked)
+        self.results.itemDoubleClicked.connect(lambda item: self.channel_controller.on_results_double_clicked(item))
         try:
-            self.results.itemActivated.connect(self._on_results_double_clicked)
+            self.results.itemActivated.connect(lambda item: self.channel_controller.on_results_double_clicked(item))
         except Exception:
             pass
 
-        # Track channel videos paging context
-        self._channel_ctx = {
-            "channel_id": None,
-            "channel_name": None,
-            "prev_tokens": [],  # stack of previous tokens
-            "current_token": None,
-            "next_token": None,
-            "cache": {},  # {page_token or None: (items, next_token)}
-        }
+        # Initialize controller for YouTube channel browsing
+        self.channel_controller = ChannelVideosController(self)
 
         # Right/Bottom: Player controls and view
         self.now_playing = QLabel("Now Playing: -")
@@ -275,7 +261,6 @@ class MainWindow(QMainWindow):
         # Queue toggle and horizontally-scrollable cards (hidden by default)
         self.btn_toggle_queue = QPushButton("Show Queue")
         self.btn_toggle_queue.setCheckable(True)
-        self.btn_toggle_queue.clicked.connect(self._toggle_queue_view)
         # Queue toggle and auto-scroll checkbox
         qrow = QHBoxLayout()
         qrow.addWidget(self.btn_toggle_queue)
@@ -295,13 +280,23 @@ class MainWindow(QMainWindow):
         self._queue_scroll.setWidget(self._queue_container)
         self._queue_scroll.setVisible(False)
         right_box.addWidget(self._queue_scroll)
+        # Queue view controller
+        self.queue_controller = QueueViewController(
+            scroll_area=self._queue_scroll,
+            layout=self._queue_layout,
+            toggle_button=self.btn_toggle_queue,
+            load_thumb=self._load_thumb,
+        )
+        self.queue_controller.set_play_handler(lambda idx: self._play_from_playlist(idx))
+        self.btn_toggle_queue.clicked.connect(self.queue_controller.toggle_view)
         # Playlist items and actions moved to left column
         right = QWidget()
         right.setLayout(right_box)
         self._right_container = right
 
-        # Menu / Settings
-        self._build_menubar()
+        # Menu / Settings via controller
+        self.menu_controller = MenuController(self)
+        self.menu_controller.attach()
 
         # Main splitter
         splitter = QSplitter()
@@ -344,243 +339,8 @@ class MainWindow(QMainWindow):
             self.playlists.setCurrentRow(0)
 
     # --- UI helpers ---
-    def _build_menubar(self) -> None:
-        menubar = QMenuBar(self)
-        settings_menu = menubar.addMenu("Settings")
-
-        act_music = settings_menu.addAction("Music Folder...")
-        act_music.triggered.connect(self._choose_music_folder)
-
-        act_flags = settings_menu.addAction("WebEngine Flags...")
-        act_flags.triggered.connect(self._open_flags_dialog)
-
-        act_env = settings_menu.addAction("Edit API Keys (.env)...")
-        act_env.triggered.connect(self._open_env_dialog)
-
-        # Advanced Details setting via dialog
-        act_adv_details = settings_menu.addAction("Advanced Details...")
-        act_adv_details.triggered.connect(self._open_advanced_details_dialog)
-
-        # Advanced menu (exposes Play Combined functionality)
-        adv_menu = menubar.addMenu("Advanced")
-        act_play_combined = adv_menu.addAction("Play Combined...")
-        act_play_combined_shuffle = adv_menu.addAction("Play Combined (Shuffle)")
-        act_show_unavailable = adv_menu.addAction("Show Unavailable...")
-        act_play_combined.triggered.connect(lambda: self._open_play_combined_dialog(False))
-        act_play_combined_shuffle.triggered.connect(lambda: self._open_play_combined_dialog(True))
-        act_show_unavailable.triggered.connect(self._open_unavailable_dialog)
-
-        self.setMenuBar(menubar)
-    def _open_advanced_details_dialog(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Advanced Details Settings")
-        layout = QVBoxLayout(dlg)
-        cb_adv = QCheckBox("Show Advanced Details for Playlist Items")
-        cb_adv.setChecked(self.advanced_details)
-        layout.addWidget(cb_adv)
-        cb_dedupe = QCheckBox("Deduplicate merged playlists")
-        cb_dedupe.setChecked(getattr(self, 'dedupe_merged', True))
-        layout.addWidget(cb_dedupe)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        layout.addWidget(buttons)
-        def on_ok():
-            self.advanced_details = cb_adv.isChecked()
-            self.dedupe_merged = cb_dedupe.isChecked()
-            self._on_playlist_selected(self._current_playlist_name() or "")
-            dlg.accept()
-        buttons.accepted.connect(on_ok)
-        buttons.rejected.connect(dlg.reject)
-        try:
-            dlg.setModal(False)
-            dlg.setWindowModality(Qt.NonModal)
-            dlg.show()
-        except Exception:
-            try:
-                dlg.exec()
-            except Exception:
-                pass
-
-    def _open_unavailable_dialog(self) -> None:
-        """Show a dialog listing all unavailable items across playlists as cards."""
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Unavailable Items")
-        # Open the dialog at a larger default size
-        try:
-            dlg.resize(500, 500)
-        except Exception:
-            pass
-        lay = QVBoxLayout(dlg)
-        info = QLabel("Items marked as unavailable. Click Close to dismiss.")
-        info.setStyleSheet("color:#666")
-        lay.addWidget(info)
-        lw = QListWidget()
-        lay.addWidget(lw)
-        # Collect unavailable items and which playlists contain them
-        items_map = []  # list of tuples (item, [playlist_names])
-        try:
-            # Build reverse index by item key for each playlist
-            for name in self.pm.names:
-                p = self.pm.get(name)
-                if not p:
-                    continue
-                for it in p.media_files:
-                    if getattr(it, "unavailable", False):
-                        key = self._item_key(it)
-                        # Try to merge duplicates into one entry
-                        found = None
-                        for j, (existing, pls) in enumerate(items_map):
-                            if self._item_key(existing) == key:
-                                found = j
-                                break
-                        if found is None:
-                            items_map.append((it, [name]))
-                        else:
-                            items_map[found][1].append(name)
-        except Exception:
-            pass
-
-        # Build card UI per unavailable item
-        for it, pls in items_map:
-            w = QWidget()
-            hbox = QHBoxLayout(w)
-            thumb = QLabel()
-            thumb.setFixedSize(120, 72)
-            thumb.setAlignment(Qt.AlignCenter)
-            if getattr(it, 'thumbnail_url', None):
-                try:
-                    self._load_thumb(it.thumbnail_url, thumb)
-                except Exception:
-                    pass
-            hbox.addWidget(thumb)
-            vbox = QVBoxLayout()
-            title = QLabel(it.title)
-            title.setStyleSheet("font-weight:600;color:#111")
-            artist = QLabel(getattr(it, 'artist', getattr(it, 'uploader', '')))  # fallback for YouTube uploader
-            artist.setStyleSheet("color:#555")
-            # Duration display (seconds -> mm:ss)
-            dur_val = getattr(it, 'duration', 0) or 0
-            def fmt_dur(sec:int) -> str:
-                m, s = divmod(int(sec), 60)
-                return f"{m}:{s:02d}"
-            duration = QLabel(f"Duration: {fmt_dur(dur_val)}")
-            duration.setStyleSheet("color:#555")
-            playlists_lbl = QLabel(f"Playlists: {', '.join(sorted(set(pls)))}")
-            playlists_lbl.setStyleSheet("color:#333")
-            vbox.addWidget(title)
-            vbox.addWidget(artist)
-            vbox.addWidget(duration)
-            vbox.addWidget(playlists_lbl)
-            hbox.addLayout(vbox)
-            itemw = QListWidgetItem(lw)
-            itemw.setSizeHint(w.sizeHint())
-            lw.addItem(itemw)
-            lw.setItemWidget(itemw, w)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Close)
-        # Add debug action to mark all unavailable items as available
-        btn_mark_all = buttons.addButton("DEBUG: Mark All Available", QDialogButtonBox.ActionRole)
-        lay.addWidget(buttons)
-
-        def _mark_all_available() -> None:
-            try:
-                # Build a set of keys represented in the dialog
-                keys = set()
-                for it, _pls in items_map:
-                    try:
-                        keys.add(self._item_key(it))
-                    except Exception:
-                        pass
-                # Walk all playlists and clear the unavailable flag for matching items
-                for name in self.pm.names:
-                    p = self.pm.get(name)
-                    if not p:
-                        continue
-                    for mf in getattr(p, 'media_files', []):
-                        try:
-                            if getattr(mf, 'unavailable', False) and self._item_key(mf) in keys:
-                                mf.unavailable = False
-                        except Exception:
-                            pass
-                # Persist once after updates
-                try:
-                    self.pm._persist()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                # Optionally refresh queue cards in case current queue was affected
-                try:
-                    self._refresh_queue_cards()
-                except Exception:
-                    pass
-            finally:
-                dlg.accept()
-
-        btn_mark_all.clicked.connect(_mark_all_available)
-        buttons.rejected.connect(dlg.reject)
-        buttons.accepted.connect(dlg.accept)
-        # Show non-modally so the main window remains usable while this dialog is open
-        try:
-            dlg.setModal(False)
-            dlg.setWindowModality(Qt.NonModal)
-            dlg.show()
-        except Exception:
-            # Fallback to exec if non-modal show fails for some reason
-            try:
-                dlg.exec()
-            except Exception:
-                pass
-
-    def _open_flags_dialog(self) -> None:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("WebEngine Flags")
-        layout = QVBoxLayout(dlg)
-
-        # Determine current flags
-        current = (self.cfg.webengine_flags or "").split()
-        cb_dc = QCheckBox("Disable Direct Composition (--disable-direct-composition)")
-        cb_gpu = QCheckBox("Disable GPU Acceleration (--disable-gpu)")
-        cb_ap = QCheckBox("Allow Autoplay without Gesture (--autoplay-policy=no-user-gesture-required)")
-        cb_dc.setChecked("--disable-direct-composition" in current or not current)
-        cb_gpu.setChecked("--disable-gpu" in current)
-
-        layout.addWidget(cb_dc)
-        layout.addWidget(cb_gpu)
-        layout.addWidget(cb_ap)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        layout.addWidget(buttons)
-
-        def on_save() -> None:
-            flags = []
-            if cb_dc.isChecked():
-                flags.append("--disable-direct-composition")
-            if cb_gpu.isChecked():
-                flags.append("--disable-gpu")
-            if cb_ap.isChecked():
-                flags.append("--autoplay-policy=no-user-gesture-required")
-            self.cfg.webengine_flags = " ".join(flags) if flags else None
-            from MusicPlayer.config.loader import save_config
-
-            save_config(self.cfg)
-            QMessageBox.information(
-                self,
-                "Saved",
-                "Flags saved. Please restart the application for changes to take effect.",
-            )
-            dlg.accept()
-
-        buttons.accepted.connect(on_save)
-        buttons.rejected.connect(dlg.reject)
-        # Show non-modally so the main window remains usable while this dialog is open
-        try:
-            dlg.setModal(False)
-            dlg.setWindowModality(Qt.NonModal)
-            dlg.show()
-        except Exception:
-            try:
-                dlg.exec()
-            except Exception:
-                pass
-
+    # Menu, dialogs, and unavailable view now handled by MenuController
+    # Removed legacy menubar and dialog methods from MainWindow.
     def _on_playlist_selected(self, name: str) -> None:
         p = self.pm.get(name)
         self.playlist_items.clear()
@@ -623,7 +383,13 @@ class MainWindow(QMainWindow):
         self._reset_shuffle()
         # Refresh queue cards and show the queue when shuffle changes
         try:
-            self._refresh_queue_cards()
+            self.queue_controller.refresh(
+                self._queue_items,
+                self._queue_index,
+                getattr(self, "_shuffled_indices", []),
+                self.shuffle_enabled,
+                self.auto_scroll_queue,
+            )
             # auto-show queue when shuffle toggled
             self._queue_scroll.setVisible(True)
             self.btn_toggle_queue.setChecked(True)
@@ -631,55 +397,44 @@ class MainWindow(QMainWindow):
             # Scroll to current track if enabled
             if self.auto_scroll_queue and self._queue_index >= 0:
                 try:
-                    self._scroll_to_card(self._queue_index)
+                    self.queue_controller.scroll_to_index(
+                        self._queue_items,
+                        self._queue_index,
+                        getattr(self, "_shuffled_indices", []),
+                        self.shuffle_enabled,
+                    )
                 except Exception:
                     pass
         except Exception:
             pass
 
     def _play_card(self, index: int) -> None:
-        """Jump to and play the given index from the queue."""
         try:
             if index < 0 or index >= len(self._queue_items):
                 return
             self._queue_index = index
             self._play_from_playlist(index)
-            # Refresh cards so highlighting updates
             try:
-                self._refresh_queue_cards()
+                self.queue_controller.refresh(
+                    self._queue_items,
+                    self._queue_index,
+                    getattr(self, "_shuffled_indices", []),
+                    self.shuffle_enabled,
+                    self.auto_scroll_queue,
+                )
             except Exception:
                 pass
         except Exception:
             pass
 
     def _scroll_to_card(self, index: int) -> None:
-        """Scroll the queue area to make the given queue index visible.
-
-        The index is a real index into `self._queue_items`. When shuffle is active
-        the displayed order may be based on `_shuffled_indices` so we map accordingly.
-        """
         try:
-            if not self._queue_card_widgets or index < 0 or index >= len(self._queue_items):
-                return
-            if self.shuffle_enabled and getattr(self, '_shuffled_indices', None):
-                display_indices = list(self._shuffled_indices)
-            else:
-                display_indices = list(range(len(self._queue_items)))
-            if index not in display_indices:
-                return
-            pos = display_indices.index(index)
-            widget = self._queue_card_widgets[pos]
-            try:
-                self._queue_scroll.ensureWidgetVisible(widget)
-            except Exception:
-                # Fallback: adjust scrollbar value to approximate position
-                try:
-                    sb = self._queue_scroll.horizontalScrollBar()
-                    # Compute target as widget x-position
-                    x = widget.x()
-                    sb.setValue(x)
-                except Exception:
-                    pass
+            self.queue_controller.scroll_to_index(
+                self._queue_items,
+                index,
+                getattr(self, "_shuffled_indices", []),
+                self.shuffle_enabled,
+            )
         except Exception:
             pass
 
@@ -703,45 +458,7 @@ class MainWindow(QMainWindow):
             save_config(self.cfg)
             QMessageBox.information(self, "Saved", f"Music folder set to:\n{folder}")
 
-    def _open_env_dialog(self) -> None:
-        dlg = QDialog(self)
-        dlg.setWindowTitle("API Keys (.env)")
-        layout = QVBoxLayout(dlg)
-
-        form = QFormLayout()
-        inp_yt = QLineEdit(get_youtube_api_key() or "")
-        inp_sc = QLineEdit(get_soundcloud_client_id() or "")
-        form.addRow("YouTube API Key", inp_yt)
-        form.addRow("SoundCloud Client ID", inp_sc)
-        layout.addLayout(form)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        layout.addWidget(buttons)
-
-        def on_save() -> None:
-            yt = inp_yt.text().strip() or None
-            sc = inp_sc.text().strip() or None
-            set_youtube_api_key(yt)
-            set_soundcloud_client_id(sc)
-            QMessageBox.information(
-                self,
-                "Saved",
-                ".env updated. Restart the application to load new keys.",
-            )
-            dlg.accept()
-
-        buttons.accepted.connect(on_save)
-        buttons.rejected.connect(dlg.reject)
-        # Show non-modally so the main window remains usable while this dialog is open
-        try:
-            dlg.setModal(False)
-            dlg.setWindowModality(Qt.NonModal)
-            dlg.show()
-        except Exception:
-            try:
-                dlg.exec()
-            except Exception:
-                pass
+    # _open_env_dialog moved to MenuController
 
     def _current_playlist_name(self) -> Optional[str]:
         item = self.playlists.currentItem()
@@ -835,242 +552,15 @@ class MainWindow(QMainWindow):
                         self.playlists.setCurrentRow(i)
                         break
 
-    def _import_playlist(self) -> None:
-        # Non-blocking dialog to input URL and choose target playlist
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Import Playlist")
-        lay = QVBoxLayout(dlg)
-        url_inp = QLineEdit()
-        url_inp.setPlaceholderText("Paste YouTube or SoundCloud playlist URL...")
-        lay.addWidget(QLabel("Playlist URL"))
-        lay.addWidget(url_inp)
-        target_box = QComboBox()
-        target_box.addItem("<Create New>")
-        for n in self.pm.names:
-            target_box.addItem(n)
-        lay.addWidget(QLabel("Import Into"))
-        lay.addWidget(target_box)
-        # Append/prepend selector for where to insert imported items
-        append_box = QComboBox()
-        append_box.addItems(["End (Append)", "Front (Prepend)"])
-        lay.addWidget(QLabel("Append To"))
-        lay.addWidget(append_box)
-        status_lbl = QLabel("")
-        lay.addWidget(status_lbl)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        lay.addWidget(buttons)
-
-        def do_import() -> None:
-            url = url_inp.text().strip()
-            if not url:
-                QMessageBox.information(self, "URL", "Enter a playlist URL.")
-                return
-            buttons.setEnabled(False)
-            status_lbl.setText("Importing... This may take a moment.")
-
-            # Run fetch in background thread
-            self._import_thread = QThread()
-            self._import_worker = ImportWorker(url, self._fetch_playlist_url)
-            self._import_worker.moveToThread(self._import_thread)
-            self._import_thread.started.connect(self._import_worker.run)
-            # Store dialog widgets for use in UI-thread slot
-            self._import_dlg = dlg
-            self._import_buttons = buttons
-            self._import_status_lbl = status_lbl
-            self._import_target_box = target_box
-            # store append/prepend choice for the finished handler
-            self._import_append_box = append_box
-            # Cleanup and connect finished signal to a MainWindow method
-            self._import_thread.finished.connect(self._import_thread.deleteLater)
-            self._import_worker.finished.connect(self._import_worker.deleteLater)
-            self._import_worker.finished.connect(self._on_import_finished)
-            self._import_thread.start()
-
-        buttons.accepted.connect(do_import)
-        buttons.rejected.connect(dlg.reject)
-        # Non-modal to keep main UI interactive
-        self._import_dlg = dlg
-        dlg.setModal(False)
-        dlg.show()
-
-    def _fetch_playlist_url(self, url: str):  # noqa: ANN001
-        from urllib.parse import urlparse, parse_qs
-        import requests
-        api_key = get_youtube_api_key()
-        sc_client_id = get_soundcloud_client_id()
-        u = urlparse(url)
-        host = u.netloc.lower()
-        # Detect YouTube playlist
-        if "youtube" in host or "youtu.be" in host:
-            qs = parse_qs(u.query)
-            playlist_id = qs.get("list", [None])[0]
-            if not playlist_id:
-                raise RuntimeError("Not a YouTube playlist URL (missing list parameter).")
-            if not api_key:
-                raise RuntimeError("YouTube API key not configured.")
-            yt_api = "https://www.googleapis.com/youtube/v3/playlistItems"
-            params = {
-                "part": "snippet",
-                "playlistId": playlist_id,
-                "maxResults": 50,
-                "key": api_key,
-            }
-            items = []
-            remote_title = None
-            while True:
-                r = requests.get(yt_api, params=params, timeout=15)
-                if r.status_code != 200:
-                    if r.status_code in (401, 403):
-                        raise RuntimeError("YouTube playlist is private or inaccessible (HTTP 403/401).")
-                    raise RuntimeError(f"YouTube API error {r.status_code}: {r.text[:200]}")
-                data = r.json()
-                if remote_title is None:
-                    remote_title = data.get("items", [{}])[0].get("snippet", {}).get("channelTitle") or "YouTube Playlist"
-                for it in data.get("items", []):
-                    snip = it.get("snippet", {})
-                    vid = snip.get("resourceId", {}).get("videoId")
-                    title = snip.get("title") or "(untitled)"
-                    channel = snip.get("videoOwnerChannelTitle") or snip.get("channelTitle") or ""
-                    thumb = snip.get("thumbnails", {}).get("default", {}).get("url")
-                    if vid:
-                        items.append(OnlineMediaFile(title=title, artist=channel, duration=0, file_path="", provider=SourceProvider.youtube, url=f"https://www.youtube.com/watch?v={vid}", source_id=vid, thumbnail_url=thumb))
-                token = data.get("nextPageToken")
-                if not token:
-                    break
-                params["pageToken"] = token
-            return items, remote_title
-        # Detect SoundCloud playlist (sets)
-        if "soundcloud" in host:
-            if not sc_client_id:
-                raise RuntimeError("SoundCloud client id not configured.")
-            resolve = "https://api.soundcloud.com/resolve"
-            rv = requests.get(resolve, params={"url": url, "client_id": sc_client_id}, timeout=15)
-            if rv.status_code != 200:
-                if rv.status_code in (401, 403):
-                    raise RuntimeError("SoundCloud playlist is private or inaccessible (HTTP 403/401).")
-                raise RuntimeError(f"SoundCloud resolve error {rv.status_code}: {rv.text[:200]}")
-            meta = rv.json()
-            if meta.get("kind") != "playlist":
-                raise RuntimeError("URL did not resolve to a SoundCloud playlist.")
-            remote_title = meta.get("title") or "SoundCloud Playlist"
-            items = []
-            for track in meta.get("tracks", []):
-                title = track.get("title") or "(untitled)"
-                artist = (track.get("user") or {}).get("username") or ""
-                duration_ms = track.get("duration") or 0
-                duration = int(duration_ms / 1000)
-                tid = track.get("id")
-                permalink = track.get("permalink_url") or ""
-                thumb = (track.get("artwork_url") or "").replace("large", "t500x500") if track.get("artwork_url") else None
-                items.append(OnlineMediaFile(title=title, artist=artist, duration=duration, file_path="", provider=SourceProvider.soundcloud, url=permalink, source_id=str(tid) if tid else None, thumbnail_url=thumb))
-            return items, remote_title
-        raise RuntimeError("Unrecognized or unsupported playlist URL.")
-
-    def _on_import_finished(self, items, remote_title, error) -> None:  # noqa: ANN001
-        # Ensure worker thread is asked to quit; do not wait here
-        thr = getattr(self, "_import_thread", None)
-        if thr is not None and thr.isRunning():
-            try:
-                thr.quit()
-            except Exception:
-                pass
-        dlg = getattr(self, "_import_dlg", None)
-        buttons = getattr(self, "_import_buttons", None)
-        status_lbl = getattr(self, "_import_status_lbl", None)
-        target_box = getattr(self, "_import_target_box", None)
-        if not (dlg and buttons and status_lbl and target_box):
-            return
-        if error:
-            QMessageBox.warning(self, "Import Failed", error)
-            try:
-                buttons.setEnabled(True)
-                status_lbl.setText("")
-            except Exception:
-                pass
-            return
-        if not items:
-            QMessageBox.information(self, "Empty", "No items found in playlist.")
-            try:
-                buttons.setEnabled(True)
-                status_lbl.setText("")
-            except Exception:
-                pass
-            return
-        target = target_box.currentText()
-        append_box = getattr(self, "_import_append_box", None)
-        append_choice = append_box.currentText() if append_box is not None else "End (Append)"
-        if target == "<Create New>":
-            default_name = remote_title or "Imported Playlist"
-            new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
-            if not ok or not new_name.strip():
-                buttons.setEnabled(True)
-                status_lbl.setText("")
-                return
-            new_name = new_name.strip()
-            if new_name in self.pm.names:
-                QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
-                buttons.setEnabled(True)
-                status_lbl.setText("")
-                return
-            self.pm.create(new_name)
-            target = new_name
-            self.playlists.addItem(new_name)
-        # Persist into playlist (prepend or append)
-        if append_choice.startswith("Front"):
-            p = self.pm.get(target)
-            if p:
-                p.media_files = items + p.media_files
-                try:
-                    self.pm._persist()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-        else:
-            for it in items:
-                self.pm.add(target, it)
-
-        # Update UI and in-memory queue if current playlist is target
-        if self._current_playlist_name() == target:
-            if append_choice.startswith("Front"):
-                for it in reversed(items):
-                    itemw = QListWidgetItem(it.title)
-                    itemw.setData(Qt.UserRole, self._item_key(it))
-                    self.playlist_items.insertItem(0, itemw)
-                self._queue_items = items + self._queue_items
-            else:
-                for it in items:
-                    itemw = QListWidgetItem(it.title)
-                    itemw.setData(Qt.UserRole, self._item_key(it))
-                    self.playlist_items.addItem(itemw)
-                self._queue_items.extend(items)
-        QMessageBox.information(self, "Imported", f"Imported {len(items)} items into '{target}'.")
-        status_lbl.setText("Import complete.")
-        try:
-            dlg.accept()
-        except Exception:
-            pass
-
-            try:
-                # Refresh and auto-show queue for playlist selection
-                self._refresh_queue_cards()
-                self._queue_scroll.setVisible(True)
-                self.btn_toggle_queue.setChecked(True)
-                self.btn_toggle_queue.setText("Hide Queue")
-            except Exception:
-                pass
+    # Import playlist handled by PlaylistImporter controller
     
     def _do_search(self) -> None:
         source = self.source.currentText()
         query = self.query.text().strip()
         self.results.clear()
-        # Any new search wipes cached channel video pages until a new channel is entered
+        # Any new search resets channel videos context
         try:
-            if isinstance(self._channel_ctx, dict):
-                self._channel_ctx["cache"] = {}
-                self._channel_ctx["channel_id"] = None
-                self._channel_ctx["channel_name"] = None
-                self._channel_ctx["prev_tokens"] = []
-                self._channel_ctx["current_token"] = None
-                self._channel_ctx["next_token"] = None
+            self.channel_controller.reset_for_new_search()
         except Exception:
             pass
         if source == "Local":
@@ -1087,17 +577,18 @@ class MainWindow(QMainWindow):
                     # If user provided a channel URL or ID/handle, resolve and list videos directly
                     cid = resolve_channel_id(api_key, query)
                     if cid:
-                        self._enter_channel_videos(cid, query)
+                        self.channel_controller.enter_channel_videos(cid, query)
                         return
                     # Otherwise, perform a channel search
                     logging.warning("YouTube channel search query='%s'", query)
                     channels = search_youtube_channels(api_key, query, max_results=10)
                     logging.warning("YouTube channel search results=%d", len(channels))
                     self._found_channels = channels  # type: ignore[attr-defined]
-                    self._populate_channel_results(channels)
+                    self.channel_controller.populate_channel_results(channels)
                     return
                 else:
-                    # Videos mode: handle inputs differently for URLs vs text
+                    # Videos mode (strict): only allow video titles or direct video URLs.
+                    # Block channel identifiers (URLs, bare @handles, bare UC channel IDs).
                     if qlow.startswith("http://") or qlow.startswith("https://"):
                         # If a YouTube channel URL is provided, inform user to use Channels mode
                         if "youtu" in qlow and ("/channel/" in qlow or "/@" in qlow):
@@ -1119,11 +610,19 @@ class MainWindow(QMainWindow):
                         else:
                             items = search_youtube(api_key, query)
                     else:
-                        # If the input points to a channel via handle/ID, fetch channel videos directly
-                        cid_try = resolve_channel_id(api_key, query)
-                        if cid_try:
-                            self._enter_channel_videos(cid_try, query)
+                        # Block bare channel handle (@name) and bare channel ID (UCxxxxxxxxxxxxxxxxxxxxxx)
+                        qstr = query.strip()
+                        is_bare_handle = bool(re.fullmatch(r"@[A-Za-z0-9._-]+", qstr))
+                        is_bare_channel_id = bool(re.fullmatch(r"UC[a-zA-Z0-9_-]{22}", qstr))
+                        if is_bare_handle or is_bare_channel_id:
+                            QMessageBox.information(
+                                self,
+                                "YouTube",
+                                "Videos mode expects video titles or video URLs.\n"
+                                "To browse a channel identifier, switch to 'Channels' mode."
+                            )
                             return
+                        # Treat everything else as a title search (do NOT resolve bare video IDs)
                         items = search_youtube(api_key, query)
         else:
             items = search_soundcloud(query)
@@ -1140,258 +639,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _populate_channel_results(self, channels) -> None:  # noqa: ANN001
-        """Render YouTube channel search results with profile picture and title.
-        Each entry is clickable (double-click) to fetch that channel's videos.
-        """
-        try:
-            from models import YoutubeChannel as _YC  # local import for type checking
-        except Exception:
-            _YC = object  # type: ignore
-        self.results.clear()
-        logging.warning("Populate channel results: %d entries", len(channels or []))
-        for ch in channels or []:
-            w = QWidget()
-            lay = QHBoxLayout(w)
-            # Channel profile image (if available)
-            thumb = QLabel()
-            thumb.setFixedSize(60, 60)
-            thumb.setAlignment(Qt.AlignCenter)
-            turl = getattr(ch, 'thumbnail_url', None)
-            if turl:
-                try:
-                    self._load_thumb(turl, thumb)
-                except Exception:
-                    pass
-            lay.addWidget(thumb)
-            box = QVBoxLayout()
-            title = QLabel(getattr(ch, 'channel_name', ''))
-            title.setStyleSheet("font-weight:600;color:#111")
-            url_lbl = QLabel(getattr(ch, 'source_url', ''))
-            url_lbl.setStyleSheet("color:#555")
-            box.addWidget(title)
-            box.addWidget(url_lbl)
-            lay.addLayout(box)
-            itemw = QListWidgetItem(self.results)
-            itemw.setSizeHint(w.sizeHint())
-            # Store an identifier for this being a channel entry
-            itemw.setData(Qt.UserRole, {"type": "channel", "id": getattr(ch, 'channel_id', None)})
-            self.results.addItem(itemw)
-            self.results.setItemWidget(itemw, w)
-        # Disable Add-to-Playlist while showing channels, and hide channel-videos controls
-        try:
-            self.btn_add.setEnabled(False)
-            self.btn_back_channels.setVisible(False)
-            self.btn_prev_page.setVisible(False)
-            self.btn_next_page.setVisible(False)
-            self.btn_save_all.setVisible(False)
-        except Exception:
-            pass
-
-    def _on_results_double_clicked(self, item):  # noqa: ANN001
-        """Handle double-clicks on results list. If in channel mode, fetch videos."""
-        try:
-            if self.source.currentText() != "YouTube":
-                return
-            mode = self.youtube_mode.currentText() if self.youtube_mode.isVisible() else "Videos"
-            if mode != "Channels":
-                return
-            api_key = get_youtube_api_key()
-            if not api_key:
-                return
-            # Determine which channel was clicked
-            row = self.results.row(item)
-            channels = getattr(self, "_found_channels", [])
-            if row < 0 or row >= len(channels):
-                return
-            ch = channels[row]
-            logging.warning("Channel selected row=%d id=%s name=%s", row, getattr(ch, 'channel_id', None), getattr(ch, 'channel_name', None))
-            cid = getattr(ch, 'channel_id', None)
-            if not cid:
-                return
-            # Enter channel videos view with paging
-            self._enter_channel_videos(cid, getattr(ch, 'channel_name', '') or getattr(ch, 'source_url', ''))
-        except Exception:
-            pass
-
-    def _enter_channel_videos(self, channel_id: str, channel_name: str) -> None:
-        """Switch UI into channel videos view, initialize paging and fetch first page."""
-        try:
-            logging.warning("Enter channel videos: id=%s name=%s", channel_id, channel_name)
-            self._channel_ctx["channel_id"] = channel_id
-            self._channel_ctx["channel_name"] = channel_name
-            self._channel_ctx["prev_tokens"] = []
-            self._channel_ctx["current_token"] = None
-            self._channel_ctx["next_token"] = None
-            # New channel selection wipes cached pages to avoid cross-channel reuse
-            try:
-                self._channel_ctx["cache"] = {}
-            except Exception:
-                pass
-            # Show channel controls
-            self.btn_back_channels.setVisible(True)
-            self.btn_prev_page.setVisible(False)
-            self.btn_next_page.setVisible(False)
-            self.btn_save_all.setVisible(True)
-            # In channel videos view, allow adding videos
-            self.btn_add.setEnabled(True)
-            # Load first page
-            self._load_channel_page(None)
-        except Exception:
-            pass
-
-    def _load_channel_page(self, page_token: Optional[str]) -> None:
-        api_key = get_youtube_api_key()
-        cid = self._channel_ctx.get("channel_id")
-        if not api_key or not cid:
-            return
-        cache = self._channel_ctx.get("cache") or {}
-        cache_key = page_token  # None for first page
-        cached = cache.get(cache_key)
-        if cached:
-            items, next_token = cached
-            logging.warning("Load channel page from cache: id=%s token=%s items=%d next=%s", cid, page_token, len(items or []), bool(next_token))
-        else:
-            try:
-                logging.warning("Fetch channel page: id=%s token=%s", cid, page_token)
-                items, next_token = list_channel_videos(api_key, cid, max_results=25, page_token=page_token)
-            except Exception as e:
-                logging.exception("Error fetching channel page: %s", e)
-                items, next_token = [], None
-            # Cache the result (even empty to avoid re-calling on back)
-            try:
-                cache[cache_key] = (items, next_token)
-                self._channel_ctx["cache"] = cache
-            except Exception:
-                pass
-        # Update tokens
-        self._channel_ctx["current_token"] = page_token
-        self._channel_ctx["next_token"] = next_token
-        # Update UI controls state
-        try:
-            has_prev = bool(self._channel_ctx.get("prev_tokens"))
-            self.btn_prev_page.setVisible(True)
-            self.btn_prev_page.setEnabled(has_prev)
-            self.btn_next_page.setVisible(True)
-            self.btn_next_page.setEnabled(bool(next_token))
-        except Exception:
-            pass
-        # Populate videos
-        logging.warning("Channel page loaded: items=%d next_token=%s", len(items), bool(next_token))
-        # TEMP: log ordered titles to verify sort/order issues
-        
-        debug_flag = False
-        if debug_flag:
-            try:
-                titles = [getattr(it, 'title', '') for it in (items or [])]
-                human = " | \n".join([f"{i+1}. {t}" for i, t in enumerate(titles)])
-                logging.warning("Channel page titles (%d): %s", len(titles), human)
-            except Exception:
-                pass
-        self._found_items = items  # type: ignore[attr-defined]
-        self._populate_results(items)
-        if not items:
-            try:
-                QMessageBox.information(self, "Channel", "No videos found for this channel or request failed.")
-            except Exception:
-                pass
-
-    def _on_channel_next_page(self) -> None:
-        # Push current token then move to next
-        try:
-            cur = self._channel_ctx.get("current_token")
-            nxt = self._channel_ctx.get("next_token")
-            if not nxt:
-                return
-            self._channel_ctx["prev_tokens"].append(cur)
-            self._load_channel_page(nxt)
-        except Exception:
-            pass
-
-    def _on_channel_prev_page(self) -> None:
-        try:
-            prev_stack = self._channel_ctx.get("prev_tokens") or []
-            if not prev_stack:
-                return
-            prev_token = prev_stack.pop()
-            self._channel_ctx["prev_tokens"] = prev_stack
-            self._load_channel_page(prev_token)
-        except Exception:
-            pass
-
-    def _on_back_to_channels(self) -> None:
-        """Return to prior channel search results."""
-        try:
-            logging.warning("Back to channel search results")
-            channels = getattr(self, "_found_channels", [])
-            self._populate_channel_results(channels)
-        except Exception:
-            pass
-
-    def _on_save_all_results(self) -> None:
-        """Save videos from current channel view: support saving first N pages including current."""
-        try:
-            cid = self._channel_ctx.get("channel_id")
-            if not cid:
-                QMessageBox.information(self, "Save", "Not in a channel videos view.")
-                return
-            api_key = get_youtube_api_key()
-            if not api_key:
-                QMessageBox.information(self, "YouTube API Key", "Configure YOUTUBE_API_KEY in .env.")
-                return
-            # Prompt for playlist name
-            default_name = (self._channel_ctx.get("channel_name") or "Channel Videos").strip() or "Channel Videos"
-            new_name, ok = QInputDialog.getText(self, "New Playlist Name", "Name", QLineEdit.Normal, default_name)
-            if not ok or not new_name.strip():
-                return
-            new_name = new_name.strip()
-            if new_name in self.pm.names:
-                QMessageBox.warning(self, "Exists", f"Playlist '{new_name}' already exists.")
-                return
-            # Prompt for number of pages
-            pages, ok_pages = QInputDialog.getInt(self, "Pages", "Save how many pages?", 1, 1, 50, 1)
-            if not ok_pages:
-                return
-            # Collect items starting from current page
-            all_items = []
-            # Start with items currently shown
-            current_items = getattr(self, "_found_items", [])
-            all_items.extend(current_items)
-            next_token = self._channel_ctx.get("next_token")
-            remaining = max(0, pages - 1)
-            cache = self._channel_ctx.get("cache") or {}
-            while remaining > 0 and next_token:
-                # Try cache first
-                cached = cache.get(next_token)
-                if cached:
-                    page_items, nt = cached
-                else:
-                    try:
-                        page_items, nt = list_channel_videos(api_key, cid, max_results=25, page_token=next_token)
-                    except Exception as e:
-                        logging.exception("Error fetching page while saving: %s", e)
-                        break
-                    # Store fetched page using the token we requested with
-                    try:
-                        cache[next_token] = (page_items, nt)
-                        self._channel_ctx["cache"] = cache
-                    except Exception:
-                        pass
-                all_items.extend(page_items)
-                remaining -= 1
-                next_token = nt
-            # Create playlist and persist
-            self.pm.create(new_name)
-            for it in all_items:
-                self.pm.add(new_name, it)
-            self.playlists.addItem(new_name)
-            QMessageBox.information(self, "Saved", f"Saved {len(all_items)} videos to '{new_name}'.")
-        except Exception as e:
-            logging.exception("Save all results failed: %s", e)
-            try:
-                QMessageBox.warning(self, "Save", "Failed to save videos. See logs for details.")
-            except Exception:
-                pass
+    
 
     def _add_selected_to_playlist(self) -> None:
         name = self._current_playlist_name()
@@ -1843,122 +1091,21 @@ class MainWindow(QMainWindow):
 
     def _toggle_queue_view(self) -> None:
         try:
-            visible = self.btn_toggle_queue.isChecked()
-            self._queue_scroll.setVisible(visible)
-            self.btn_toggle_queue.setText("Hide Queue" if visible else "Show Queue")
+            self.queue_controller.toggle_view()
         except Exception:
             pass
 
     def _refresh_queue_cards(self) -> None:
-        """Rebuild the horizontal list of cards showing items in the current queue."""
         try:
-            # Clear existing cards
-            while self._queue_layout.count():
-                item = self._queue_layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.setParent(None)
-
-            # Determine display order: use shuffled indices if shuffle mode is active
-            if self.shuffle_enabled and getattr(self, '_shuffled_indices', None):
-                display_indices = list(self._shuffled_indices)
-            else:
-                display_indices = list(range(len(self._queue_items)))
-
-            # Rebuild list of card widgets in display order
-            self._queue_card_widgets = []
-            for pos, idx in enumerate(display_indices):
-                it = self._queue_items[idx]
-                btn = QPushButton()
-                btn.setCheckable(False)
-                btn.setFlat(False)
-                btn.setCursor(Qt.PointingHandCursor)
-                btn.setFixedSize(140, 150)
-                # Build card layout inside the button
-                card_w = QWidget()
-                v = QVBoxLayout(card_w)
-                v.setContentsMargins(4, 4, 4, 4)
-                thumb = QLabel()
-                # Slightly shorter thumbnails in the queue to avoid vertical letterboxing
-                thumb.setFixedSize(120, 72)
-                thumb.setAlignment(Qt.AlignCenter)
-                thumb.setStyleSheet("background:transparent;")
-                title = QLabel(it.title)
-                title.setWordWrap(True)
-                title.setFixedWidth(120)
-                title.setStyleSheet("font-size:11px;")
-                v.addWidget(thumb, alignment=Qt.AlignCenter)
-                v.addWidget(title, alignment=Qt.AlignCenter)
-                btn.setLayout(QVBoxLayout())
-                btn.layout().addWidget(card_w)
-                # Load thumbnail if available
-                try:
-                    if getattr(it, 'thumbnail_url', None):
-                        self._load_thumb(it.thumbnail_url, thumb)
-                except Exception:
-                    pass
-
-                # Color by position relative to current displayed position
-                try:
-                    pos_current = None
-                    if self._queue_index in display_indices:
-                        pos_current = display_indices.index(self._queue_index)
-                    if pos_current is not None:
-                        if pos == pos_current:
-                            color = '#d4ffd9'
-                        elif pos < pos_current:
-                            color = '#ffd6d6'
-                        else:
-                            color = '#d6e7ff'
-                    else:
-                        # Fallback to direct index comparison
-                        if self._queue_index == idx:
-                            color = '#d4ffd9'
-                        elif self._queue_index >= 0 and idx < self._queue_index:
-                            color = '#ffd6d6'
-                        else:
-                            color = '#d6e7ff'
-                    btn.setStyleSheet(f'background-color: {color}; border-radius:6px;')
-                except Exception:
-                    pass
-
-                # Connect click to play this real queue index
-                btn.clicked.connect(lambda _, i=idx: self._play_card(i))
-                self._queue_layout.addWidget(btn)
-                self._queue_card_widgets.append(btn)
-
-            # Auto-scroll to current card if enabled
-            try:
-                if self.auto_scroll_queue and self._queue_index >= 0 and self._queue_card_widgets:
-                    if self._queue_index in display_indices:
-                        pos_current = display_indices.index(self._queue_index)
-                        widget = self._queue_card_widgets[pos_current]
-                        # Schedule scrolling after layout settles so it reliably moves into view
-                        def _do_scroll():
-                            try:
-                                # Prefer centering the widget in the viewport
-                                viewport = self._queue_scroll.viewport()
-                                sb = self._queue_scroll.horizontalScrollBar()
-                                # absolute x position of the widget inside the container
-                                x = widget.x()
-                                w = widget.width()
-                                vp_w = viewport.width()
-                                # target scroll value to center the widget
-                                target = max(0, x - (vp_w - w) // 2)
-                                sb.setValue(target)
-                            except Exception:
-                                try:
-                                    self._queue_scroll.ensureWidgetVisible(widget)
-                                except Exception:
-                                    pass
-
-                        QTimer.singleShot(50, _do_scroll)
-            except Exception:
-                pass
+            self.queue_controller.refresh(
+                self._queue_items,
+                self._queue_index,
+                getattr(self, "_shuffled_indices", []),
+                self.shuffle_enabled,
+                self.auto_scroll_queue,
+            )
         except Exception:
             pass
-
-        # removed local nested _play_card; use the class-level `_play_card` method
 
     
     def _on_playlist_items_context_menu(self, pos):
