@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QLabel, QComboBox, QSplitter, QAbstractItemView, QMenu, QMessageBox, QWidget, QListWidgetItem, QCheckBox, QSizePolicy, QStyledItemDelegate, QStyle
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QLabel, QComboBox, QSplitter, QAbstractItemView, QMenu, QMessageBox, QWidget, QListWidgetItem, QCheckBox, QSizePolicy, QStyledItemDelegate, QStyle, QSpinBox, QDialogButtonBox, QFormLayout, QMenuBar
 )
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtCore import QUrl
@@ -11,6 +11,7 @@ from collections import OrderedDict
 # Thumbnail and row sizing (keep "card" look consistently)
 THUMB_SIZE = QSize(80, 60)
 ROW_HEIGHT = 80
+TEXT_ONLY_ROW_HEIGHT = 30
 
 # Roles for storing thumbnail metadata
 THUMB_URL_ROLE = Qt.UserRole + 1
@@ -33,6 +34,7 @@ class ThumbnailLoader:
 
     def set_cache_max_items(self, n: int):
         self._cache_max = max(0, int(n))
+        self._cache_trim()
 
     def _cache_get(self, url):
         if not self._cache_enabled:
@@ -47,6 +49,10 @@ class ThumbnailLoader:
             return
         self._cache[url] = pm
         self._cache.move_to_end(url)
+        while len(self._cache) > self._cache_max:
+            self._cache.popitem(last=False)
+
+    def _cache_trim(self):
         while len(self._cache) > self._cache_max:
             self._cache.popitem(last=False)
 
@@ -148,6 +154,10 @@ class PlaylistItemDelegate(QStyledItemDelegate):
     def __init__(self, loader: ThumbnailLoader, parent=None):
         super().__init__(parent)
         self._loader = loader
+        self._text_only = False
+
+    def set_text_only(self, enabled: bool):
+        self._text_only = bool(enabled)
 
     def paint(self, painter: QPainter, option, index):
         # Background/selection
@@ -160,23 +170,29 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
         rect = option.rect
         margin = 6
-        thumb_rect = QRect(rect.left() + margin, rect.top() + (ROW_HEIGHT - THUMB_SIZE.height()) // 2, THUMB_SIZE.width(), THUMB_SIZE.height())
-        text_left = thumb_rect.right() + 8
-        title_rect = QRect(text_left, rect.top() + 10, rect.width() - (text_left - rect.left()) - 10, 20)
-        sub_rect = QRect(text_left, rect.top() + 32, rect.width() - (text_left - rect.left()) - 10, 18)
+        if self._text_only:
+            text_left = rect.left() + margin
+            title_rect = QRect(text_left, rect.top() + 4, rect.width() - (text_left - rect.left()) - 10, 16)
+            sub_rect = QRect(text_left, rect.top() + 18, rect.width() - (text_left - rect.left()) - 10, 12)
+        else:
+            thumb_rect = QRect(rect.left() + margin, rect.top() + (ROW_HEIGHT - THUMB_SIZE.height()) // 2, THUMB_SIZE.width(), THUMB_SIZE.height())
+            text_left = thumb_rect.right() + 8
+            title_rect = QRect(text_left, rect.top() + 10, rect.width() - (text_left - rect.left()) - 10, 20)
+            sub_rect = QRect(text_left, rect.top() + 32, rect.width() - (text_left - rect.left()) - 10, 18)
 
         # Draw thumbnail or placeholder
-        url = index.data(THUMB_URL_ROLE)
-        pm = None
-        if url:
-            pm = self._loader.get_cached_pixmap(url)
-        if pm is not None and not pm.isNull():
-            scaled = pm.scaled(THUMB_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            painter.drawPixmap(thumb_rect, scaled)
-        else:
-            painter.fillRect(thumb_rect, QColor('#e5e7eb'))
-            painter.setPen(QColor('#cbd5e1'))
-            painter.drawRect(thumb_rect)
+        if not self._text_only:
+            url = index.data(THUMB_URL_ROLE)
+            pm = None
+            if url:
+                pm = self._loader.get_cached_pixmap(url)
+            if pm is not None and not pm.isNull():
+                scaled = pm.scaled(THUMB_SIZE, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                painter.drawPixmap(thumb_rect, scaled)
+            else:
+                painter.fillRect(thumb_rect, QColor('#e5e7eb'))
+                painter.setPen(QColor('#cbd5e1'))
+                painter.drawRect(thumb_rect)
             # restore pen for text
             if option.state & QStyle.State_Selected:
                 painter.setPen(option.palette.highlightedText().color())
@@ -192,6 +208,8 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             parts = title.split(" — ", 1)
             t_text, s_text = parts[0], parts[1]
         font = painter.font()
+        if self._text_only:
+            font.setPointSize(max(10, font.pointSize()))
         font.setBold(True)
         painter.setFont(font)
         painter.drawText(title_rect, Qt.TextSingleLine | Qt.AlignVCenter, t_text)
@@ -202,7 +220,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         painter.restore()
 
     def sizeHint(self, option, index):  # noqa: D401
-        return QSize(option.rect.width(), ROW_HEIGHT)
+        return QSize(option.rect.width(), TEXT_ONLY_ROW_HEIGHT if self._text_only else ROW_HEIGHT)
 
 class PlaylistEditWindow(QDialog):
     def __init__(self, parent=None):
@@ -216,6 +234,10 @@ class PlaylistEditWindow(QDialog):
         # Global cache override (code-only toggle), default on
         self._cache_override = True
         self._thumb_loader = ThumbnailLoader(self._net, self, max_concurrency=12, cache_enabled=self._cache_override, cache_max_items=1500)
+        # Explicit override (default ON)
+        if self._cache_override:
+            self._thumb_loader.set_cache_enabled(True)
+        self._text_only = False
         # Debounce timers for viewport-aware lazy loading
         self._debounce1 = QTimer(self)
         self._debounce1.setSingleShot(True)
@@ -224,6 +246,15 @@ class PlaylistEditWindow(QDialog):
         self._debounce2.setSingleShot(True)
         self._debounce2.setInterval(80)
         self._build_ui()
+        # Apply persisted settings (text-only and cache max)
+        try:
+            settings = QSettings("MusicPlayer", "MusicPlayer")
+            text_only = settings.value("playlist_edit/text_only", False, type=bool)
+            cache_max = settings.value("playlist_edit/cache_max", 1500, type=int)
+            self._toggle_text_only(text_only)
+            self._on_cache_max_changed(cache_max)
+        except Exception:
+            pass
         # Set initial size (width=600, height=800) without restricting resizing
         try:
             self.resize(600, 800)
@@ -303,6 +334,12 @@ class PlaylistEditWindow(QDialog):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        # Menubar with Settings
+        menubar = QMenuBar(self)
+        settings_menu = menubar.addMenu("Settings")
+        act_opts = settings_menu.addAction("Playlist Editor...")
+        act_opts.triggered.connect(self._open_inline_settings)
+        layout.setMenuBar(menubar)
         # Playlist selectors
         selector_row = QHBoxLayout()
         self.combo1 = QComboBox()
@@ -318,7 +355,7 @@ class PlaylistEditWindow(QDialog):
         selector_row.addWidget(self.lbl_pl2)
         selector_row.addWidget(self.combo2)
         layout.addLayout(selector_row)
-        # Mode toggle for merge/transfer features
+        # Mode toggle row for features (no inline cache controls)
         mode_row = QHBoxLayout()
         self.chk_merge = QCheckBox("Merge/Transfer Playlists")
         self.chk_merge.toggled.connect(self._toggle_merge_mode)
@@ -393,18 +430,31 @@ class PlaylistEditWindow(QDialog):
         self.btn_save_changes.clicked.connect(self._save_changes)
         bottom_row.addWidget(self.btn_save_changes)
         layout.addLayout(bottom_row)
-        # Use a custom delegate to paint card-like rows for text-only mode
+        # Use a custom delegate to paint card-like rows for thumbnails, dense when text-only
         try:
-            self.list1.setItemDelegate(PlaylistItemDelegate(self._thumb_loader, self.list1))
-            self.list2.setItemDelegate(PlaylistItemDelegate(self._thumb_loader, self.list2))
+            d1 = PlaylistItemDelegate(self._thumb_loader, self.list1)
+            d1.set_text_only(self._text_only)
+            self.list1.setItemDelegate(d1)
+            d2 = PlaylistItemDelegate(self._thumb_loader, self.list2)
+            d2.set_text_only(self._text_only)
+            self.list2.setItemDelegate(d2)
         except Exception:
             pass
-        # Lazy loading: trigger on scroll
+        # Connect debounce timers once
         try:
-            self.list1.verticalScrollBar().valueChanged.connect(lambda _: self._on_scroll_debounced(1))
-            self.list2.verticalScrollBar().valueChanged.connect(lambda _: self._on_scroll_debounced(2))
+            self._debounce1.timeout.connect(lambda: self._load_visible_thumbs(self.list1))
+            self._debounce2.timeout.connect(lambda: self._load_visible_thumbs(self.list2))
         except Exception:
             pass
+        # Lazy loading: trigger on scroll with named slots (easier to disconnect)
+        try:
+            self.list1.verticalScrollBar().valueChanged.connect(self._on_scroll1)
+            self.list2.verticalScrollBar().valueChanged.connect(self._on_scroll2)
+            self._scroll_connected1 = True
+            self._scroll_connected2 = True
+        except Exception:
+            self._scroll_connected1 = False
+            self._scroll_connected2 = False
         self._load_playlist1(self.combo1.currentText())
         self._load_playlist2(self.combo2.currentText())
         # Initialize in single-playlist mode
@@ -585,27 +635,34 @@ class PlaylistEditWindow(QDialog):
                 itemw.setData(Qt.UserRole, self._item_key(it))
                 if getattr(it, "thumbnail_url", None):
                     itemw.setData(THUMB_URL_ROLE, it.thumbnail_url)
-                if use_widgets:
-                    w = QWidget()
-                    lay = QHBoxLayout(w)
-                    lay.setContentsMargins(4, 4, 4, 4)
-                    thumb = QLabel()
-                    thumb.setFixedSize(THUMB_SIZE)
-                    # deferred loading; handled lazily
-                    lay.addWidget(thumb)
-                    box = QVBoxLayout()
-                    box.setContentsMargins(0, 0, 0, 0)
-                    t = QLabel(it.title)
-                    t.setStyleSheet("font-weight:600;color:#111")
-                    sub = QLabel(getattr(it, "artist", getattr(it, "uploader", "")))
-                    sub.setStyleSheet("color:#555")
-                    box.addWidget(t)
-                    box.addWidget(sub)
-                    lay.addLayout(box)
-                    w.setFixedHeight(ROW_HEIGHT)
-                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
-                    self.list1.addItem(itemw)
-                    self.list1.setItemWidget(itemw, w)
+                if getattr(self, "_text_only", False):
+                    if use_widgets:
+                        w = QWidget()
+                        lay = QHBoxLayout(w)
+                        lay.setContentsMargins(4, 4, 4, 4)
+                        thumb = QLabel()
+                        thumb.setFixedSize(THUMB_SIZE)
+                        # deferred loading; handled lazily
+                        lay.addWidget(thumb)
+                        box = QVBoxLayout()
+                        box.setContentsMargins(0, 0, 0, 0)
+                        t = QLabel(it.title)
+                        t.setStyleSheet("font-weight:600;color:#111")
+                        sub = QLabel(getattr(it, "artist", getattr(it, "uploader", "")))
+                        sub.setStyleSheet("color:#555")
+                        box.addWidget(t)
+                        box.addWidget(sub)
+                        lay.addLayout(box)
+                        w.setFixedHeight(ROW_HEIGHT)
+                        itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
+                        self.list1.addItem(itemw)
+                        self.list1.setItemWidget(itemw, w)
+                    else:
+                        title = it.title
+                        sub = getattr(it, "artist", getattr(it, "uploader", ""))
+                        itemw.setText(f"{title} — {sub}" if sub else title)
+                        itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
+                        self.list1.addItem(itemw)
                 else:
                     title = it.title
                     sub = getattr(it, "artist", getattr(it, "uploader", ""))
@@ -649,6 +706,9 @@ class PlaylistEditWindow(QDialog):
 
     def _load_visible_thumbs(self, list_widget):
         try:
+            # In text-only mode, avoid any image loading
+            if getattr(self, "_text_only", False):
+                return
             viewport = list_widget.viewport()
             vrect = viewport.rect()
             count = list_widget.count()
@@ -678,6 +738,9 @@ class PlaylistEditWindow(QDialog):
 
     def _on_scroll_debounced(self, which):
         try:
+            # If text-only, do nothing; no thumbnails to load
+            if getattr(self, "_text_only", False):
+                return
             if which == 1:
                 if self._debounce1.isActive():
                     self._debounce1.stop()
@@ -699,6 +762,134 @@ class PlaylistEditWindow(QDialog):
                 self._debounce2.start()
         except Exception:
             pass
+
+    def _toggle_text_only(self, enabled: bool):
+        try:
+            self._text_only = bool(enabled)
+            try:
+                settings = QSettings("MusicPlayer", "MusicPlayer")
+                settings.setValue("playlist_edit/text_only", self._text_only)
+            except Exception:
+                pass
+            # Connect/disconnect scroll handlers and stop timers as needed
+            try:
+                if self._text_only:
+                    if getattr(self, "_scroll_connected1", False):
+                        try:
+                            self.list1.verticalScrollBar().valueChanged.disconnect(self._on_scroll1)
+                        except Exception:
+                            pass
+                        self._scroll_connected1 = False
+                    if getattr(self, "_scroll_connected2", False):
+                        try:
+                            self.list2.verticalScrollBar().valueChanged.disconnect(self._on_scroll2)
+                        except Exception:
+                            pass
+                        self._scroll_connected2 = False
+                    try:
+                        self._debounce1.stop()
+                        self._debounce2.stop()
+                    except Exception:
+                        pass
+                else:
+                    if not getattr(self, "_scroll_connected1", False):
+                        try:
+                            self.list1.verticalScrollBar().valueChanged.connect(self._on_scroll1)
+                            self._scroll_connected1 = True
+                        except Exception:
+                            pass
+                    if not getattr(self, "_scroll_connected2", False):
+                        try:
+                            self.list2.verticalScrollBar().valueChanged.connect(self._on_scroll2)
+                            self._scroll_connected2 = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            # Update delegates to respect this mode
+            d1 = self.list1.itemDelegate()
+            if isinstance(d1, PlaylistItemDelegate):
+                d1.set_text_only(self._text_only)
+            d2 = self.list2.itemDelegate()
+            if isinstance(d2, PlaylistItemDelegate):
+                d2.set_text_only(self._text_only)
+            # Adjust row heights for density
+            new_h = TEXT_ONLY_ROW_HEIGHT if self._text_only else ROW_HEIGHT
+            try:
+                for lw in (self.list1, self.list2):
+                    for i in range(lw.count()):
+                        it = lw.item(i)
+                        it.setSizeHint(QSize(it.sizeHint().width(), new_h))
+                    try:
+                        lw.doItemsLayout()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # Force repaint and avoid new loads when enabled
+            self.list1.viewport().update()
+            self.list2.viewport().update()
+            if not self._text_only:
+                # When turning thumbnails back on, load visible ones
+                self._load_visible_thumbs(self.list1)
+                self._load_visible_thumbs(self.list2)
+        except Exception:
+            pass
+
+    def _on_cache_max_changed(self, n: int):
+        try:
+            self._thumb_loader.set_cache_max_items(int(n))
+            try:
+                settings = QSettings("MusicPlayer", "MusicPlayer")
+                settings.setValue("playlist_edit/cache_max", int(n))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_scroll1(self, _val: int):
+        self._on_scroll_debounced(1)
+
+    def _on_scroll2(self, _val: int):
+        self._on_scroll_debounced(2)
+
+    def _open_inline_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Playlist Editor Settings")
+        lay = QVBoxLayout(dlg)
+        form = QFormLayout()
+        settings = QSettings("MusicPlayer", "MusicPlayer")
+        text_only = settings.value("playlist_edit/text_only", False, type=bool)
+        cache_max = settings.value("playlist_edit/cache_max", 1500, type=int)
+        cb_text = QCheckBox("Text-only (no thumbnails)")
+        cb_text.setChecked(text_only)
+        sp_cache = QSpinBox()
+        sp_cache.setRange(100, 10000)
+        sp_cache.setSingleStep(100)
+        sp_cache.setValue(cache_max)
+        form.addRow("Text-only mode", cb_text)
+        form.addRow("Thumbnail cache max", sp_cache)
+        lay.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        lay.addWidget(buttons)
+
+        def on_save():
+            # Apply via existing handlers (which also persist)
+            self._toggle_text_only(cb_text.isChecked())
+            self._on_cache_max_changed(sp_cache.value())
+            dlg.accept()
+
+        buttons.accepted.connect(on_save)
+        buttons.rejected.connect(dlg.reject)
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            try:
+                dlg.exec()
+            except Exception:
+                pass
 
     def _load_playlist2(self, name):
         from PySide6.QtGui import QPixmap
@@ -744,7 +935,8 @@ class PlaylistEditWindow(QDialog):
                     title = it.title
                     sub = getattr(it, "artist", getattr(it, "uploader", ""))
                     itemw.setText(f"{title} — {sub}" if sub else title)
-                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
+                    new_h = TEXT_ONLY_ROW_HEIGHT if getattr(self, "_text_only", False) else ROW_HEIGHT
+                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), new_h))
                     self.list2.addItem(itemw)
             try:
                 self._load_visible_thumbs(self.list2)

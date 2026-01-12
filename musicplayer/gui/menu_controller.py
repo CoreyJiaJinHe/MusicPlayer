@@ -1,5 +1,5 @@
 from typing import Optional
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtWidgets import (
     QMenuBar,
     QDialog,
@@ -9,6 +9,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QWidget,
+    QSpinBox,
+    QFormLayout,
 )
 
 from MusicPlayer.config.loader import (
@@ -37,6 +39,8 @@ class MenuController:
 
         act_adv_details = settings_menu.addAction("Advanced Details...")
         act_adv_details.triggered.connect(self._open_advanced_details_dialog)
+
+        # Playlist Editor settings are now part of the editor window UI
 
         adv_menu = menubar.addMenu("Advanced")
         act_play_combined = adv_menu.addAction("Play Combined...")
@@ -78,6 +82,8 @@ class MenuController:
                 dlg.exec()
             except Exception:
                 pass
+
+    # Removed: _open_playlist_editor_settings; settings live in the editor window
 
     def _open_flags_dialog(self) -> None:
         dlg = QDialog(self.main)
