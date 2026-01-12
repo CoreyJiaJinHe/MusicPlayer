@@ -621,55 +621,44 @@ class PlaylistEditWindow(QDialog):
             QMessageBox.warning(self, "Save", "Failed to save changes.")
 
     def _load_playlist1(self, name):
-        from PySide6.QtGui import QPixmap
-        from PySide6.QtCore import QUrl
-        from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
         self.selected_playlist1 = name
         self.list1.clear()
         p = self.pm.get(name)
         if p:
             MAX_WIDGET_ITEMS = 400
-            use_widgets = len(p.media_files) <= MAX_WIDGET_ITEMS
+            use_widgets = (len(p.media_files) <= MAX_WIDGET_ITEMS) and (not getattr(self, "_text_only", False))
             for it in p.media_files:
                 itemw = QListWidgetItem(self.list1)
                 itemw.setData(Qt.UserRole, self._item_key(it))
                 if getattr(it, "thumbnail_url", None):
                     itemw.setData(THUMB_URL_ROLE, it.thumbnail_url)
-                if getattr(self, "_text_only", False):
-                    if use_widgets:
-                        w = QWidget()
-                        lay = QHBoxLayout(w)
-                        lay.setContentsMargins(4, 4, 4, 4)
-                        thumb = QLabel()
-                        thumb.setFixedSize(THUMB_SIZE)
-                        # deferred loading; handled lazily
-                        lay.addWidget(thumb)
-                        box = QVBoxLayout()
-                        box.setContentsMargins(0, 0, 0, 0)
-                        t = QLabel(it.title)
-                        t.setStyleSheet("font-weight:600;color:#111")
-                        sub = QLabel(getattr(it, "artist", getattr(it, "uploader", "")))
-                        sub.setStyleSheet("color:#555")
-                        box.addWidget(t)
-                        box.addWidget(sub)
-                        lay.addLayout(box)
-                        w.setFixedHeight(ROW_HEIGHT)
-                        itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
-                        self.list1.addItem(itemw)
-                        self.list1.setItemWidget(itemw, w)
-                    else:
-                        title = it.title
-                        sub = getattr(it, "artist", getattr(it, "uploader", ""))
-                        itemw.setText(f"{title} — {sub}" if sub else title)
-                        itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
-                        self.list1.addItem(itemw)
+                if use_widgets:
+                    w = QWidget()
+                    lay = QHBoxLayout(w)
+                    lay.setContentsMargins(4, 4, 4, 4)
+                    thumb = QLabel()
+                    thumb.setFixedSize(THUMB_SIZE)
+                    lay.addWidget(thumb)
+                    box = QVBoxLayout()
+                    box.setContentsMargins(0, 0, 0, 0)
+                    t = QLabel(it.title)
+                    t.setStyleSheet("font-weight:600;color:#111")
+                    sub = QLabel(getattr(it, "artist", getattr(it, "uploader", "")))
+                    sub.setStyleSheet("color:#555")
+                    box.addWidget(t)
+                    box.addWidget(sub)
+                    lay.addLayout(box)
+                    w.setFixedHeight(ROW_HEIGHT)
+                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
+                    self.list1.addItem(itemw)
+                    self.list1.setItemWidget(itemw, w)
                 else:
                     title = it.title
                     sub = getattr(it, "artist", getattr(it, "uploader", ""))
                     itemw.setText(f"{title} — {sub}" if sub else title)
-                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), ROW_HEIGHT))
+                    new_h = TEXT_ONLY_ROW_HEIGHT if getattr(self, "_text_only", False) else ROW_HEIGHT
+                    itemw.setSizeHint(QSize(itemw.sizeHint().width(), new_h))
                     self.list1.addItem(itemw)
-            # initial visible thumbs
             try:
                 self._load_visible_thumbs(self.list1)
             except Exception:
@@ -684,25 +673,7 @@ class PlaylistEditWindow(QDialog):
         url = getattr(it, "url", None)
         return f"{prov_val}:{sid or url or ''}"
 
-    def _load_thumb(self, url, label):
-        try:
-            from PySide6.QtNetwork import QNetworkRequest
-            req = QNetworkRequest(QUrl(url))
-            reply = self._net.get(req)
-            def _on_finished():
-                from PySide6.QtGui import QPixmap
-                try:
-                    data = reply.readAll()
-                    pm = QPixmap()
-                    if pm.loadFromData(bytes(data)):
-                        label.setPixmap(pm.scaled(80, 60, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                except Exception:
-                    pass
-                finally:
-                    reply.deleteLater()
-            reply.finished.connect(_on_finished)
-        except Exception:
-            pass
+    # Removed legacy _load_thumb; lazy loader handles thumbnails
 
     def _load_visible_thumbs(self, list_widget):
         try:
@@ -744,21 +715,10 @@ class PlaylistEditWindow(QDialog):
             if which == 1:
                 if self._debounce1.isActive():
                     self._debounce1.stop()
-                # reconnect to ensure updated closure
-                try:
-                    self._debounce1.timeout.disconnect()
-                except Exception:
-                    pass
-                self._debounce1.timeout.connect(lambda: self._load_visible_thumbs(self.list1))
                 self._debounce1.start()
             else:
                 if self._debounce2.isActive():
                     self._debounce2.stop()
-                try:
-                    self._debounce2.timeout.disconnect()
-                except Exception:
-                    pass
-                self._debounce2.timeout.connect(lambda: self._load_visible_thumbs(self.list2))
                 self._debounce2.start()
         except Exception:
             pass
@@ -892,9 +852,6 @@ class PlaylistEditWindow(QDialog):
                 pass
 
     def _load_playlist2(self, name):
-        from PySide6.QtGui import QPixmap
-        from PySide6.QtCore import QUrl
-        from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
         if name == "<None>":
             self.selected_playlist2 = None
             self.list2.clear()
@@ -904,7 +861,7 @@ class PlaylistEditWindow(QDialog):
         p = self.pm.get(name)
         if p:
             MAX_WIDGET_ITEMS = 400
-            use_widgets = len(p.media_files) <= MAX_WIDGET_ITEMS
+            use_widgets = (len(p.media_files) <= MAX_WIDGET_ITEMS) and (not getattr(self, "_text_only", False))
             for it in p.media_files:
                 itemw = QListWidgetItem(self.list2)
                 itemw.setData(Qt.UserRole, self._item_key(it))
