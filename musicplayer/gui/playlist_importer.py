@@ -36,10 +36,11 @@ class ImportWorker(QObject):
             self.finished.emit([], "", str(e))
 
 
-class PlaylistImporter:
+class PlaylistImporter(QObject):
     """Controller to handle importing playlists from YouTube/SoundCloud."""
 
     def __init__(self, main_window) -> None:
+        super().__init__(main_window)
         self.main = main_window
         # Threading state for import operations
         self._import_thread: Optional[QThread] = None
@@ -96,6 +97,7 @@ class PlaylistImporter:
             # Cleanup and finished handling
             self._import_thread.finished.connect(self._import_thread.deleteLater)
             self._import_worker.finished.connect(self._import_worker.deleteLater)
+            # Ensure slot runs in the main (GUI) thread via QObject affinity
             self._import_worker.finished.connect(self._on_import_finished)
             self._import_thread.start()
 
