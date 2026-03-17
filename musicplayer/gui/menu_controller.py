@@ -46,9 +46,11 @@ class MenuController:
         act_play_combined = adv_menu.addAction("Play Combined...")
         act_play_combined_shuffle = adv_menu.addAction("Play Combined (Shuffle)")
         act_show_unavailable = adv_menu.addAction("Show Unavailable...")
+        act_show_deleted = adv_menu.addAction("Show Deleted...")
         act_play_combined.triggered.connect(lambda: self.main._open_play_combined_dialog(False))
         act_play_combined_shuffle.triggered.connect(lambda: self.main._open_play_combined_dialog(True))
         act_show_unavailable.triggered.connect(self._open_unavailable_dialog)
+        act_show_deleted.triggered.connect(self._open_deleted_dialog)
 
         self.main.setMenuBar(menubar)
 
@@ -239,6 +241,82 @@ class MenuController:
                 dlg.accept()
 
         btn_mark_all.clicked.connect(_mark_all_available)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        try:
+            dlg.setModal(False)
+            dlg.setWindowModality(Qt.NonModal)
+            dlg.show()
+        except Exception:
+            try:
+                dlg.exec()
+            except Exception:
+                pass
+
+    def _open_deleted_dialog(self) -> None:
+        """Show a dialog listing deleted items across playlists."""
+        from PySide6.QtWidgets import QListWidget, QListWidgetItem, QHBoxLayout, QVBoxLayout
+
+        dlg = QDialog(self.main)
+        dlg.setWindowTitle("Deleted Items")
+        try:
+            dlg.resize(500, 500)
+        except Exception:
+            pass
+        lay = QVBoxLayout(dlg)
+        info = QLabel("Items whose title indicates they were deleted.")
+        info.setStyleSheet("color:#666")
+        lay.addWidget(info)
+        lw = QListWidget()
+        lay.addWidget(lw)
+
+        items_map = []  # list of tuples (item, [playlist_names])
+        try:
+            for name in self.main.pm.names:
+                p = self.main.pm.get(name)
+                if not p:
+                    continue
+                for it in p.media_files:
+                    title = (getattr(it, "title", "") or "").strip().lower()
+                    if title != "deleted video":
+                        continue
+                    key = self.main._item_key(it)
+                    found = None
+                    for j, (existing, pls) in enumerate(items_map):
+                        if self.main._item_key(existing) == key:
+                            found = j
+                            break
+                    if found is None:
+                        items_map.append((it, [name]))
+                    else:
+                        items_map[found][1].append(name)
+        except Exception:
+            pass
+
+        for it, pls in items_map:
+            w = QWidget()
+            hbox = QHBoxLayout(w)
+            vbox = QVBoxLayout()
+            title_text = getattr(it, "source_id", None) or "(missing source id)"
+            title = QLabel(str(title_text))
+            title.setStyleSheet("font-weight:600;color:#111")
+            provider_val = getattr(it, "provider", "")
+            provider_str = provider_val.value if hasattr(provider_val, "value") else str(provider_val)
+            provider = QLabel(f"Provider: {provider_str}")
+            provider.setStyleSheet("color:#555")
+            playlists_lbl = QLabel(f"Playlists: {', '.join(sorted(set(pls)))}")
+            playlists_lbl.setStyleSheet("color:#333")
+            vbox.addWidget(title)
+            vbox.addWidget(provider)
+            vbox.addWidget(playlists_lbl)
+            hbox.addLayout(vbox)
+            itemw = QListWidgetItem(lw)
+            itemw.setSizeHint(w.sizeHint())
+            lw.addItem(itemw)
+            lw.setItemWidget(itemw, w)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        lay.addWidget(buttons)
         buttons.rejected.connect(dlg.reject)
         buttons.accepted.connect(dlg.accept)
         try:
