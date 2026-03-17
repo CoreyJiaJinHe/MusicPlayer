@@ -23,6 +23,7 @@ class MediaFile:
 class Playlist:
     name: str
     media_files: List[MediaFile]
+    source_url: Optional[str] = None
 
 
 @dataclass

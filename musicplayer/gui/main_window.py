@@ -85,12 +85,14 @@ class MainWindow(QMainWindow):
         btn_new_pl = QPushButton("New Playlist")
         btn_del_pl = QPushButton("Delete Playlist")
         btn_import_pl = QPushButton("Import Playlist")
+        btn_export_pl = QPushButton("Export Playlist")
         btn_edit_pl = QPushButton("Edit Playlist")
         btn_new_pl.clicked.connect(self._create_playlist)
         btn_del_pl.clicked.connect(self._delete_playlist)
         # Use PlaylistImporter controller
         self.playlist_importer = PlaylistImporter(self)
         btn_import_pl.clicked.connect(self.playlist_importer.open_dialog)
+        btn_export_pl.clicked.connect(self.playlist_importer.export_selected_playlist)
         btn_edit_pl.clicked.connect(self._open_edit_playlist_window)
 
         left_box = QVBoxLayout()
@@ -102,6 +104,7 @@ class MainWindow(QMainWindow):
         left_box.addWidget(btn_new_pl)
         left_box.addWidget(btn_del_pl)
         left_box.addWidget(btn_import_pl)
+        left_box.addWidget(btn_export_pl)
         left_box.addWidget(btn_edit_pl)
         # Preference: auto-scroll queue to current track when playback changes
         self.auto_scroll_queue = True

@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QLabel, QComboBox, QSplitter, QAbstractItemView, QMenu, QMessageBox, QWidget, QListWidgetItem, QCheckBox, QSizePolicy, QStyledItemDelegate, QStyle, QSpinBox, QDialogButtonBox, QFormLayout, QMenuBar
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QLabel, QComboBox, QSplitter, QAbstractItemView, QMenu, QMessageBox, QWidget, QListWidgetItem, QCheckBox, QSizePolicy, QStyledItemDelegate, QStyle, QSpinBox, QDialogButtonBox, QFormLayout, QMenuBar, QLineEdit
 )
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PySide6.QtCore import QUrl
@@ -226,7 +226,8 @@ class PlaylistEditWindow(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Edit Playlists")
-        self.pm = PlaylistManager()
+        self.main = parent if parent is not None else None
+        self.pm = self.main.pm if self.main is not None and hasattr(self.main, "pm") else PlaylistManager()
         self.selected_playlist1 = None
         self.selected_playlist2 = None
         self._last_dedupe_backup = None
@@ -422,10 +423,24 @@ class PlaylistEditWindow(QDialog):
         self.col2_layout.addWidget(self.btn_copy_2to1)
         self.splitter.addWidget(self.col2)
         layout.addWidget(self.splitter)
-        # (Row removed: buttons now placed under their respective columns)
-        # Save changes button
+        # Bottom controls: source-url tools on left, sync/save tools on right
         bottom_row = QHBoxLayout()
+        self.lbl_source = QLabel("Source URL")
+        self.inp_source_url = QLineEdit()
+        self.inp_source_url.setPlaceholderText("https://... (YouTube/SoundCloud playlist URL)")
+        self.btn_save_source = QPushButton("Save Source")
+        self.btn_save_source.clicked.connect(self._save_source_url)
+        bottom_row.addWidget(self.lbl_source)
+        bottom_row.addWidget(self.inp_source_url, 1)
+        bottom_row.addWidget(self.btn_save_source)
         bottom_row.addStretch(1)
+
+        self.btn_sync_full = QPushButton("Sync Playlist")
+        self.btn_sync_full.clicked.connect(lambda: self._sync_current_playlist(additions_only=False))
+        self.btn_sync_add = QPushButton("Sync Additions")
+        self.btn_sync_add.clicked.connect(lambda: self._sync_current_playlist(additions_only=True))
+        bottom_row.addWidget(self.btn_sync_full)
+        bottom_row.addWidget(self.btn_sync_add)
         self.btn_save_changes = QPushButton("Save Changes")
         self.btn_save_changes.clicked.connect(self._save_changes)
         bottom_row.addWidget(self.btn_save_changes)
@@ -459,6 +474,7 @@ class PlaylistEditWindow(QDialog):
         self._load_playlist2(self.combo2.currentText())
         # Initialize in single-playlist mode
         self._toggle_merge_mode(False)
+        self._refresh_source_url_field(self.combo1.currentText())
         # Initialize duplicate badge
         try:
             self._update_dup_badge()
@@ -476,8 +492,58 @@ class PlaylistEditWindow(QDialog):
             # Toggle remove/undo duplicates row (shown only in single mode)
             self.row_remove_dups.setVisible(not bool(enabled))
             self.btn_undo_remove.setVisible(not bool(enabled))
+            # Hide source/sync controls in merge mode to reduce visual bloat
+            single_mode = not bool(enabled)
+            self.lbl_source.setVisible(single_mode)
+            self.inp_source_url.setVisible(single_mode)
+            self.btn_save_source.setVisible(single_mode)
+            self.btn_sync_full.setVisible(single_mode)
+            self.btn_sync_add.setVisible(single_mode)
             # Hide splitter handle when single mode
             self.splitter.setHandleWidth(5 if enabled else 0)
+        except Exception:
+            pass
+
+    def _refresh_source_url_field(self, playlist_name):
+        try:
+            p = self.pm.get(playlist_name) if playlist_name else None
+            self.inp_source_url.setText((getattr(p, "source_url", None) or "") if p else "")
+        except Exception:
+            self.inp_source_url.setText("")
+
+    def _save_source_url(self):
+        try:
+            name = self.combo1.currentText()
+            if not name:
+                QMessageBox.information(self, "Source URL", "Select Playlist 1 first.")
+                return
+            src = self.inp_source_url.text().strip() or None
+            self.pm.set_source_url(name, src)
+            QMessageBox.information(self, "Source URL", "Source URL saved.")
+        except Exception:
+            QMessageBox.warning(self, "Source URL", "Failed to save source URL.")
+
+    def _sync_current_playlist(self, additions_only: bool):
+        name = self.combo1.currentText()
+        if not name:
+            QMessageBox.information(self, "Sync", "Select Playlist 1 first.")
+            return
+        if self.main is None or not hasattr(self.main, "playlist_importer"):
+            QMessageBox.warning(self, "Sync", "Sync is unavailable because the main importer is not attached.")
+            return
+        try:
+            self.main.playlist_importer.sync_playlist(name, additions_only, on_done=self._on_sync_done)
+        except Exception:
+            QMessageBox.warning(self, "Sync", "Failed to start sync.")
+
+    def _on_sync_done(self, ok: bool):
+        if not ok:
+            return
+        name = self.combo1.currentText()
+        try:
+            self._load_playlist1(name)
+            self._update_dup_badge()
+            self._refresh_source_url_field(name)
         except Exception:
             pass
 
@@ -624,6 +690,7 @@ class PlaylistEditWindow(QDialog):
         self.selected_playlist1 = name
         self.list1.clear()
         p = self.pm.get(name)
+        self._refresh_source_url_field(name)
         if p:
             MAX_WIDGET_ITEMS = 400
             use_widgets = (len(p.media_files) <= MAX_WIDGET_ITEMS) and (not getattr(self, "_text_only", False))

@@ -47,6 +47,23 @@ def _dict_to_mediafile(d: Dict[str, Any]) -> Union[MediaFile, OnlineMediaFile]:
     )
 
 
+def playlist_to_dict(playlist: Playlist) -> Dict[str, Any]:
+    return {
+        "name": playlist.name,
+        "source_url": playlist.source_url,
+        "media_files": [_mediafile_to_dict(it) for it in playlist.media_files],
+    }
+
+
+def dict_to_playlist(data: Dict[str, Any]) -> Playlist:
+    items = [_dict_to_mediafile(it) for it in data.get("media_files", [])]
+    return Playlist(
+        name=data.get("name", ""),
+        media_files=items,
+        source_url=data.get("source_url"),
+    )
+
+
 class PlaylistStorage:
     def __init__(self, path: str = DEFAULT_PLAYLISTS_PATH):
         self.path = path
@@ -56,20 +73,9 @@ class PlaylistStorage:
             return []
         with open(self.path, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        playlists: List[Playlist] = []
-        for p in raw or []:
-            items = [_dict_to_mediafile(it) for it in p.get("media_files", [])]
-            playlists.append(Playlist(name=p.get("name", ""), media_files=items))
-        return playlists
+        return [dict_to_playlist(p) for p in (raw or [])]
 
     def save(self, playlists: List[Playlist]) -> None:
-        wire = []
-        for p in playlists:
-            wire.append(
-                {
-                    "name": p.name,
-                    "media_files": [_mediafile_to_dict(it) for it in p.media_files],
-                }
-            )
+        wire = [playlist_to_dict(p) for p in playlists]
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(wire, f, indent=2)

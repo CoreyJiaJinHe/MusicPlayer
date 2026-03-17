@@ -16,10 +16,10 @@ class PlaylistManager:
     def get(self, name: str) -> Optional[Playlist]:
         return self._playlists.get(name)
 
-    def create(self, name: str) -> Playlist:
+    def create(self, name: str, source_url: Optional[str] = None) -> Playlist:
         if name in self._playlists:
             raise ValueError(f"Playlist '{name}' already exists")
-        p = Playlist(name=name, media_files=[])
+        p = Playlist(name=name, media_files=[], source_url=source_url)
         self._playlists[name] = p
         self._persist()
         return p
@@ -42,6 +42,16 @@ class PlaylistManager:
     def add(self, playlist: str, item: MediaFile) -> None:
         p = self._require(playlist)
         p.media_files.append(item)
+        self._persist()
+
+    def replace_items(self, playlist: str, items: List[MediaFile]) -> None:
+        p = self._require(playlist)
+        p.media_files = list(items)
+        self._persist()
+
+    def set_source_url(self, playlist: str, source_url: Optional[str]) -> None:
+        p = self._require(playlist)
+        p.source_url = source_url
         self._persist()
 
     def remove(self, playlist: str, index: int) -> None:
