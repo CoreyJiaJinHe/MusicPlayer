@@ -376,7 +376,24 @@ class PlaylistImporter(QObject):
             have = set(existing_keys)
             to_add = [it for it in remote_items if self.main._item_key(it) not in have]
             if to_add:
-                self.main.pm.replace_items(playlist_name, existing_items + to_add)
+                remote_new_indices = [
+                    i for i, it in enumerate(remote_items)
+                    if self.main._item_key(it) not in have
+                ]
+                remote_existing_indices = [
+                    i for i, it in enumerate(remote_items)
+                    if self.main._item_key(it) in have
+                ]
+
+                # If all new tracks are before the first known track, keep a
+                # newest-first style by prepending additions. Otherwise append.
+                place_front = False
+                if remote_new_indices and remote_existing_indices:
+                    first_existing_idx = min(remote_existing_indices)
+                    place_front = max(remote_new_indices) < first_existing_idx
+
+                new_items = (to_add + existing_items) if place_front else (existing_items + to_add)
+                self.main.pm.replace_items(playlist_name, new_items)
             added_count = len(to_add)
             removed_count = 0
         else:

@@ -972,6 +972,8 @@ class PlaylistEditWindow(QDialog):
         act_remove = menu.addAction("Remove Selected")
         act_move_up = menu.addAction("Move Up")
         act_move_down = menu.addAction("Move Down")
+        act_move_top = menu.addAction("Move to Top")
+        act_move_bottom = menu.addAction("Move to Bottom")
         chosen = menu.exec_(list_widget.mapToGlobal(pos))
         selected = list_widget.selectedItems()
         if not selected:
@@ -991,6 +993,19 @@ class PlaylistEditWindow(QDialog):
                 if row < list_widget.count() - 1:
                     item = list_widget.takeItem(row)
                     list_widget.insertItem(row + 1, item)
+        elif chosen == act_move_top:
+            moved = []
+            for i, row in enumerate(rows):
+                moved.append(list_widget.takeItem(row - i))
+            for i, item in enumerate(moved):
+                list_widget.insertItem(i, item)
+        elif chosen == act_move_bottom:
+            moved = [list_widget.item(row) for row in rows]
+            for row in reversed(rows):
+                list_widget.takeItem(row)
+            start = list_widget.count()
+            for i, item in enumerate(moved):
+                list_widget.insertItem(start + i, item)
 
     def _remove_from_playlist(self, which, row):
         if which == 1 and self.selected_playlist1:
